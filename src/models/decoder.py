@@ -1,5 +1,6 @@
 import torch
 import torch.nn as nn
+from torch.nn.init import trunc_normal_
 import numpy as np
 from einops import rearrange
 
@@ -130,12 +131,14 @@ class ActionReconstructionDecoder(nn.Module):
                  num_heads=12, 
                  learn_sigma=False,
                  img_size=128,
-                 frames=16):
+                 frames=16,
+                 use_checkpoint=False):
         super().__init__()
         self.in_channels = in_channels
         self.out_channels = in_channels * 2 if learn_sigma else in_channels
         self.patch_size = patch_size
         self.num_heads = num_heads
+        self.use_checkpoint = use_checkpoint
         
         # Input embedding for Noisy Latents (Video Patches)
         # Assuming we are working in a Latent Space (e.g. VAE encoded video) or Pixel Space
@@ -160,7 +163,19 @@ class ActionReconstructionDecoder(nn.Module):
         # num_patches needs to be calculated based on input resolution
         self.num_patches = frames * (img_size // patch_size) ** 2
         print(f"DEBUG: Initializing ActionReconstructionDecoder with num_patches={self.num_patches}, img_size={img_size}, frames={frames}")
-        self.pos_embed = nn.Parameter(torch.zeros(1, self.num_patches, hidden_size), requires_grad=True)
+        
+        # Use Factorized 3D Positional Embeddings instead of 1D
+        self.num_frames = frames
+        self.h_patches = img_size // patch_size
+        self.w_patches = img_size // patch_size
+        
+        self.pos_embed_t = nn.Parameter(torch.zeros(1, self.num_frames, hidden_size))
+        self.pos_embed_h = nn.Parameter(torch.zeros(1, self.h_patches, hidden_size))
+        self.pos_embed_w = nn.Parameter(torch.zeros(1, self.w_patches, hidden_size))
+        
+        trunc_normal_(self.pos_embed_t, std=0.02)
+        trunc_normal_(self.pos_embed_h, std=0.02)
+        trunc_normal_(self.pos_embed_w, std=0.02)
 
         self.blocks = nn.ModuleList([
             DiTBlock(hidden_size, num_heads) for _ in range(depth)
@@ -190,7 +205,8 @@ class ActionReconstructionDecoder(nn.Module):
         # Zero-out output layers:
         nn.init.constant_(self.final_layer.adaLN_modulation[-1].weight, 0)
         nn.init.constant_(self.final_layer.adaLN_modulation[-1].bias, 0)
-        nn.init.constant_(self.final_layer.linear.weight, 0)
+        # Use Xavier init for linear layer to ensure gradient flow, instead of Zero init
+        torch.nn.init.xavier_uniform_(self.final_layer.linear.weight)
         nn.init.constant_(self.final_layer.linear.bias, 0)
 
     def unpatchify(self, x, T, H, W):
@@ -221,9 +237,25 @@ class ActionReconstructionDecoder(nn.Module):
         x = x.view(B, C, T, H // p, p, W // p, p)
         x = x.permute(0, 2, 3, 5, 4, 6, 1).contiguous()
         x = x.view(B, -1, p * p * C)
-        
         # 2. Embeddings
-        x = self.x_embedder(x) + self.pos_embed[:, :x.shape[1], :]
+        x = self.x_embedder(x)
+        
+        # Add 3D Positional Embeddings
+        # pos_embed_t: (1, T, D) -> (1, T, 1, 1, D)
+        # pos_embed_h: (1, H, D) -> (1, 1, H, 1, D)
+        # pos_embed_w: (1, W, D) -> (1, 1, 1, W, D)
+        pos_embed = (self.pos_embed_t.unsqueeze(2).unsqueeze(3) + 
+                     self.pos_embed_h.unsqueeze(1).unsqueeze(3) + 
+                     self.pos_embed_w.unsqueeze(1).unsqueeze(2)) # (1, T, H, W, D)
+        
+        pos_embed = pos_embed.flatten(1, 3) # (1, T*H*W, D)
+        
+        # Ensure pos_embed matches x length (handle potential mismatch if any)
+        if pos_embed.shape[1] == x.shape[1]:
+            x = x + pos_embed
+        else:
+            x = x + pos_embed[:, :x.shape[1], :]
+
         t_emb = self.t_embedder(t)
         
         # 3. Condition Processing
@@ -232,7 +264,10 @@ class ActionReconstructionDecoder(nn.Module):
         
         # 4. Transformer Blocks
         for block in self.blocks:
-            x = block(x, c, z_action)
+            if self.use_checkpoint:
+                x = torch.utils.checkpoint.checkpoint(block, x, c, z_action, use_reentrant=False)
+            else:
+                x = block(x, c, z_action)
             
         # 5. Final Layer
         x = self.final_layer(x, c)

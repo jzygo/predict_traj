@@ -1,7 +1,69 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torchvision import models
 from torchvision.models.optical_flow import raft_small
+
+class VGGLoss(nn.Module):
+    def __init__(self, device='cuda'):
+        super().__init__()
+        vgg = models.vgg16(pretrained=True).features.to(device).eval()
+        for param in vgg.parameters():
+            param.requires_grad = False
+            
+        self.slice1 = torch.nn.Sequential()
+        self.slice2 = torch.nn.Sequential()
+        self.slice3 = torch.nn.Sequential()
+        self.slice4 = torch.nn.Sequential()
+        
+        for x in range(4):
+            self.slice1.add_module(str(x), vgg[x])
+        for x in range(4, 9):
+            self.slice2.add_module(str(x), vgg[x])
+        for x in range(9, 16):
+            self.slice3.add_module(str(x), vgg[x])
+        for x in range(16, 23):
+            self.slice4.add_module(str(x), vgg[x])
+            
+        self.register_buffer('mean', torch.tensor([0.485, 0.456, 0.406], device=device).view(1, 3, 1, 1))
+        self.register_buffer('std', torch.tensor([0.229, 0.224, 0.225], device=device).view(1, 3, 1, 1))
+
+    def forward(self, input, target):
+        # input, target: (B, C, H, W) in [-1, 1]
+        if input.shape[1] == 1:
+            input = input.repeat(1, 3, 1, 1)
+        if target.shape[1] == 1:
+            target = target.repeat(1, 3, 1, 1)
+
+        input = (input + 1) / 2
+        target = (target + 1) / 2
+        
+        input = (input - self.mean) / self.std
+        target = (target - self.mean) / self.std
+        
+        h = self.slice1(input)
+        h_relu1_2 = h
+        h = self.slice2(h)
+        h_relu2_2 = h
+        h = self.slice3(h)
+        h_relu3_3 = h
+        h = self.slice4(h)
+        h_relu4_3 = h
+        
+        h_target = self.slice1(target)
+        h_target_relu1_2 = h_target
+        h_target = self.slice2(h_target)
+        h_target_relu2_2 = h_target
+        h_target = self.slice3(h_target)
+        h_target_relu3_3 = h_target
+        h_target = self.slice4(h_target)
+        h_target_relu4_3 = h_target
+        
+        loss = F.mse_loss(h_relu1_2, h_target_relu1_2) + \
+               F.mse_loss(h_relu2_2, h_target_relu2_2) + \
+               F.mse_loss(h_relu3_3, h_target_relu3_3) + \
+               F.mse_loss(h_relu4_3, h_target_relu4_3)
+        return loss
 
 class CompositeLoss(nn.Module):
     def __init__(self, lambda_rec=1.0, lambda_flow=1.0, lambda_perceptual=0.1, device='cuda'):
@@ -26,7 +88,7 @@ class CompositeLoss(nn.Module):
             self.lpips_fn.eval()
         except ImportError:
             print("Warning: LPIPS not found, using simple VGG loss placeholder.")
-            self.lpips_fn = None
+            self.lpips_fn = VGGLoss(device=device)
 
     def calculate_flow(self, video):
         # video: (B, C, T, H, W)
@@ -38,15 +100,29 @@ class CompositeLoss(nn.Module):
         img1 = video[:, :, :-1].reshape(-1, c, h, w)
         img2 = video[:, :, 1:].reshape(-1, c, h, w)
         
+        if c == 1:
+            img1 = img1.repeat(1, 3, 1, 1)
+            img2 = img2.repeat(1, 3, 1, 1)
+        
         # Normalize to [-1, 1] if not already
         # RAFT expects input in [-1, 1] range roughly, usually 0-255 mapped.
         # Assuming video is normalized.
         
-        list_of_flows = self.flow_model(img1, img2)
-        predicted_flow = list_of_flows[-1] # Use the final refinement
+        # Upsample if too small for RAFT (needs at least 128x128)
+        if h < 128 or w < 128:
+            img1 = F.interpolate(img1, size=(max(h, 128), max(w, 128)), mode='bilinear', align_corners=False)
+            img2 = F.interpolate(img2, size=(max(h, 128), max(w, 128)), mode='bilinear', align_corners=False)
+
+        output = self.flow_model(img1, img2)
+        if isinstance(output, list):
+            predicted_flow = output[-1] # Use the final refinement
+        else:
+            print("Unexpected RAFT output format.")
+            predicted_flow = output
         
         # Reshape back to (B, T-1, 2, H, W)
-        predicted_flow = predicted_flow.view(b, t-1, 2, h, w)
+        h_flow, w_flow = predicted_flow.shape[-2:]
+        predicted_flow = predicted_flow.view(b, t-1, 2, h_flow, w_flow)
         return predicted_flow
 
     def forward(self, target_video, pred_video):
@@ -87,6 +163,10 @@ class CompositeLoss(nn.Module):
             b, c, t, h, w = target_video.shape
             t_flat = target_video.view(-1, c, h, w)
             p_flat = pred_video.view(-1, c, h, w)
+            
+            if c == 1:
+                t_flat = t_flat.repeat(1, 3, 1, 1)
+                p_flat = p_flat.repeat(1, 3, 1, 1)
             
             # Downsample if too large to save memory
             if h > 128:

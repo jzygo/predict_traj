@@ -1,6 +1,7 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torch.nn.init import trunc_normal_
 from einops import rearrange, repeat
 
 class PatchEmbed3D(nn.Module):
@@ -68,17 +69,21 @@ class VisualActionEncoder(nn.Module):
                  patch_size=16, 
                  frames=16, 
                  tubelet_size=2, 
+                 in_chans=3,
                  embed_dim=768, 
                  depth=12, 
                  num_heads=12, 
-                 num_queries=32):
+                 num_queries=32,
+                 use_checkpoint=False):
         super().__init__()
         
+        self.use_checkpoint = use_checkpoint
         # 1. Input Representation: 3D Patch Embedding
-        self.patch_embed = PatchEmbed3D(img_size, patch_size, frames, tubelet_size, in_chans=3, embed_dim=embed_dim)
+        self.patch_embed = PatchEmbed3D(img_size, patch_size, frames, tubelet_size, in_chans=in_chans, embed_dim=embed_dim)
         
         # Positional Embeddings
         self.pos_embed = nn.Parameter(torch.zeros(1, self.patch_embed.num_patches, embed_dim))
+        trunc_normal_(self.pos_embed, std=0.02)
         
         # 2. Backbone: Standard ViT Encoder Blocks (simplified)
         encoder_layer = nn.TransformerEncoderLayer(d_model=embed_dim, nhead=num_heads, batch_first=True)
@@ -93,7 +98,12 @@ class VisualActionEncoder(nn.Module):
         x = x + self.pos_embed
         
         # Extract Spatio-temporal features
-        visual_features = self.backbone(x) # (B, L, D)
+        if self.use_checkpoint:
+            visual_features = x
+            for layer in self.backbone.layers:
+                visual_features = torch.utils.checkpoint.checkpoint(layer, visual_features, use_reentrant=False)
+        else:
+            visual_features = self.backbone(x) # (B, L, D)
         
         # Compress to Action Latents
         z_action = self.compressor(visual_features) # (B, N=32, D)

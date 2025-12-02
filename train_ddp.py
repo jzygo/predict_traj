@@ -25,12 +25,19 @@ import torch.distributed as dist
 import torch.multiprocessing as mp
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data import DataLoader, DistributedSampler
+from torch.cuda.amp import autocast, GradScaler
 import yaml
 import argparse
 from tqdm import tqdm
 import cv2
 import numpy as np
 import random
+import socket
+
+def find_free_port():
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        s.bind(('', 0))
+        return s.getsockname()[1]
 
 from src.models.tokenizer import VisualActionTokenizer
 from src.losses.composite_loss import CompositeLoss
@@ -57,14 +64,18 @@ def save_video_sample(video_tensor, save_path):
     
     for t in range(T):
         frame = video_np[t]
-        frame = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
+        if C == 1:
+            frame = cv2.cvtColor(frame, cv2.COLOR_GRAY2BGR)
+        else:
+            frame = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
         out.write(frame)
         
     out.release()
 
 def setup(rank, world_size):
     os.environ['MASTER_ADDR'] = 'localhost'
-    os.environ['MASTER_PORT'] = '12355'
+    if 'MASTER_PORT' not in os.environ:
+        os.environ['MASTER_PORT'] = '12355'
     dist.init_process_group("nccl", rank=rank, world_size=world_size)
 
 def cleanup():
@@ -74,19 +85,29 @@ def train(rank, world_size, config):
     setup(rank, world_size)
     
     # 1. Prepare Data
-    dataset = CalligraphyVideoDataset(root_dir=config['data_path'], frames=config['frames'], img_size=config['img_size'])
+    dataset = CalligraphyVideoDataset(
+        root_dir=config['data_path'], 
+        frames=config['frames'], 
+        img_size=config['img_size'], 
+        channels=config.get('in_chans', 3),
+        data_percentage=config.get('data_percentage', 1.0)
+    )
     sampler = DistributedSampler(dataset, num_replicas=world_size, rank=rank)
     dataloader = DataLoader(dataset, batch_size=config['batch_size'], sampler=sampler, num_workers=4, pin_memory=True)
     
     # 2. Prepare Model
     model = VisualActionTokenizer(
         img_size=config['img_size'],
+        patch_size=config['patch_size'],
         frames=config['frames'],
+        in_chans=config.get('in_chans', 3),
         embed_dim=config['embed_dim'],
-        num_queries=config['num_queries']
+        num_heads=config.get('num_heads', 12),
+        num_queries=config['num_queries'],
+        use_checkpoint=config.get('use_checkpoint', True)
     ).to(rank)
     
-    model = DDP(model, device_ids=[rank])
+    model = DDP(model, device_ids=[rank], find_unused_parameters=True)
     
     # 3. Optimizer
     optimizer = torch.optim.AdamW(model.parameters(), lr=float(config['lr']))
@@ -99,9 +120,20 @@ def train(rank, world_size, config):
         lambda_perceptual=config['lambda_perceptual'],
         device=rank
     )
+
+    scaler = GradScaler()
+
+    # Diffusion Scheduler (Linear)
+    num_timesteps = 1000
+    beta_start = 0.0001
+    beta_end = 0.02
+    betas = torch.linspace(beta_start, beta_end, num_timesteps, device=rank)
+    alphas = 1.0 - betas
+    alphas_cumprod = torch.cumprod(alphas, dim=0)
     
     # 5. Training Loop
     num_epochs = config['epochs']
+    accumulation_steps = config.get('accumulation_steps', 1)
     
     for epoch in range(num_epochs):
         sampler.set_epoch(epoch)
@@ -117,63 +149,116 @@ def train(rank, world_size, config):
         else:
             pbar = dataloader
             
+        optimizer.zero_grad()
+        
         for batch_idx, video in enumerate(pbar):
             video = video.to(rank)
             
             # Diffusion Training Logic
-            # 1. Encode clean video to get Action Latents
-            # Note: In a real scenario, we might want to stop gradients flowing back into Encoder 
-            # if we are training them separately, but here we train end-to-end.
-            z_action = model.module.encoder(video)
-            
-            # 2. Add Noise to Video (Diffusion Process)
-            t = torch.randint(0, 1000, (video.shape[0],), device=rank).long()
+            # 1. Add Noise to Video (Diffusion Process)
+            t = torch.randint(0, num_timesteps, (video.shape[0],), device=rank).long()
             noise = torch.randn_like(video)
             
-            # Simple linear noise scheduler for demo (replace with proper scheduler)
-            alpha = 1 - (t / 1000.0).view(-1, 1, 1, 1, 1)
-            noisy_video = video * torch.sqrt(alpha) + noise * torch.sqrt(1 - alpha)
+            # Proper scheduler
+            sqrt_alphas_cumprod_t = torch.sqrt(alphas_cumprod[t]).view(-1, 1, 1, 1, 1)
+            sqrt_one_minus_alphas_cumprod_t = torch.sqrt(1.0 - alphas_cumprod[t]).view(-1, 1, 1, 1, 1)
+            noisy_video = video * sqrt_alphas_cumprod_t + noise * sqrt_one_minus_alphas_cumprod_t
             
-            # 3. Predict (Denoise)
-            # The decoder tries to predict the original video (x0) or the noise (epsilon)
-            # Here we predict x0 for simplicity with the reconstruction loss
-            pred_video = model.module.decoder(noisy_video, t, z_action)
+            with autocast():
+                # 2. Predict (Denoise)
+                # Uses the internal denoise method which handles encoding and decoding
+                # IMPORTANT: Call model(...) directly to ensure DDP hooks are triggered!
+                pred_video = model(video, t=t, noisy_video=noisy_video)
+                
+                # 4. Calculate Loss
+                # We compare predicted x0 with real x0 (video)
+                loss, loss_dict = criterion(video, pred_video)
+                
+                # Normalize loss for gradient accumulation
+                loss = loss / accumulation_steps
             
-            # 4. Calculate Loss
-            # We compare predicted x0 with real x0 (video)
-            loss, loss_dict = criterion(video, pred_video)
+            scaler.scale(loss).backward()
             
-            optimizer.zero_grad()
-            loss.backward()
-            optimizer.step()
+            if (batch_idx + 1) % accumulation_steps == 0:
+                scaler.step(optimizer)
+                scaler.update()
+                optimizer.zero_grad()
             
-            # Accumulate metrics
-            epoch_loss += loss.item()
+            # Accumulate metrics (multiply back to get real loss for logging)
+            epoch_loss += loss.item() * accumulation_steps
             epoch_flow_loss += loss_dict['flow_loss'].item()
             num_batches += 1
             
             if rank == 0:
-                pbar.set_postfix(loss=loss.item(), flow=loss_dict['flow_loss'].item())
+                pbar.set_postfix(loss=loss.item() * accumulation_steps, flow=loss_dict['flow_loss'].item())
         
         scheduler.step()
         current_lr = optimizer.param_groups[0]['lr']
-        # Calculate and print average loss
-        avg_loss = epoch_loss / num_batches
-        avg_flow = epoch_flow_loss / num_batches
-        print(f"Epoch {epoch} Summary: Avg Loss: {avg_loss:.4f}, Avg Flow Loss: {avg_flow:.4f}, LR: {current_lr:.6f}")
 
-        if rank == 0 and batch_idx % 10 == 0:
+        if rank == 0:
             
-            os.makedirs("checkpoints", exist_ok=True)
-            # Save checkpoint
-            torch.save(model.module.state_dict(), f"checkpoints/model.pth")
+            # Calculate and print average loss
+            avg_loss = epoch_loss / num_batches
+            avg_flow = epoch_flow_loss / num_batches
+            print(f"Epoch {epoch} Summary: Avg Loss: {avg_loss:.4f}, Avg Flow Loss: {avg_flow:.4f}, LR: {current_lr:.6f}")
             
-            # Save random sample video
-            if 'pred_video' in locals():
+            if (epoch + 1) % 10 == 0:
+                os.makedirs("checkpoints", exist_ok=True)
+                # Save checkpoint
+                torch.save(model.module.state_dict(), f"checkpoints/model_epoch_{epoch+1}.pth")
+                
+                # Save random sample video with full inference
                 os.makedirs("debug", exist_ok=True)
-                idx = random.randint(0, pred_video.shape[0] - 1)
-                sample_video = pred_video[idx] # (C, T, H, W)
-                save_video_sample(sample_video, f"debug/epoch_{epoch}_sample.mp4")
+                
+                # Pick a random video from the last batch to use as condition (for action latents)
+                idx = random.randint(0, video.shape[0] - 1)
+                sample_input = video[idx].unsqueeze(0) # (1, C, T, H, W)
+                
+                model.eval()
+                with torch.no_grad():
+                    # 1. Encode
+                    z_action = model.module.encoder(sample_input)
+                    
+                    # 2. Diffusion Sampling
+                    # Start from noise
+                    img = torch.randn_like(sample_input)
+                    
+                    for i in reversed(range(0, num_timesteps)):
+                        t_tensor = torch.full((1,), i, device=rank, dtype=torch.long)
+                        
+                        # Predict x0
+                        pred_x0 = model.module.decoder(img, t_tensor, z_action)
+                        
+                        # Calculate posterior mean and variance
+                        alpha = alphas[i]
+                        alpha_cumprod = alphas_cumprod[i]
+                        if i > 0:
+                            alpha_cumprod_prev = alphas_cumprod[i-1]
+                        else:
+                            alpha_cumprod_prev = torch.tensor(1.0, device=rank)
+                            
+                        beta = betas[i]
+                        
+                        # Posterior Mean (x0 parameterization)
+                        posterior_mean = (
+                            torch.sqrt(alpha_cumprod_prev) * beta / (1 - alpha_cumprod) * pred_x0 +
+                            torch.sqrt(alpha) * (1 - alpha_cumprod_prev) / (1 - alpha_cumprod) * img
+                        )
+                        
+                        if i > 0:
+                            posterior_variance = beta * (1 - alpha_cumprod_prev) / (1 - alpha_cumprod)
+                            noise = torch.randn_like(img)
+                            img = posterior_mean + torch.sqrt(posterior_variance) * noise
+                        else:
+                            img = pred_x0
+                            
+                    sample_video = img[0] # (C, T, H, W)
+                    save_video_sample(sample_video, f"debug/epoch_{epoch+1}_inference.mp4")
+                    
+                    # Also save the ground truth for comparison
+                    save_video_sample(sample_input[0], f"debug/epoch_{epoch+1}_gt.mp4")
+                
+                model.train()
             
     cleanup()
 
@@ -181,10 +266,15 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument('--config', type=str, default='configs/train_config.yaml')
     args = parser.parse_args()
-    
     with open(args.config, 'r') as f:
         config = yaml.safe_load(f)
         
+    # Set a free port for DDP
+    if 'MASTER_PORT' not in os.environ:
+        port = find_free_port()
+        os.environ['MASTER_PORT'] = str(port)
+        print(f"Using MASTER_PORT: {port}")
+
     # 由于是多人共用服务器，开头已经选择了显存占用最低的GPU
     # 根据 CUDA_VISIBLE_DEVICES 确定 world_size
     if "CUDA_VISIBLE_DEVICES" in os.environ:

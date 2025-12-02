@@ -1,11 +1,12 @@
 import cv2
 import os
 import numpy as np
+import argparse
 
-def process_video():
+def process_video(target_frames=None):
     # 定义输入和输出路径
-    input_path = os.path.join('data', 'linqiange', 'bi.mp4')
-    output_dir = 'debug'
+    input_path = os.path.join('../data', 'linqiange', 'bi.mp4')
+    output_dir = '../debug'
     output_path = os.path.join(output_dir, 'output_grid.mp4')
 
     # 检查输入文件是否存在
@@ -22,7 +23,7 @@ def process_video():
     # 获取视频属性
     width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
     height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-    fps = cap.get(cv2.CAP_PROP_FPS)
+    fps = 3
     total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
 
     print(f"Original Video: {width}x{height} @ {fps}fps, {total_frames} frames")
@@ -40,12 +41,39 @@ def process_video():
     fourcc = cv2.VideoWriter_fourcc(*'mp4v')
     out = cv2.VideoWriter(output_path, fourcc, fps, (out_w, out_h))
 
-    frame_idx = 0
-    while True:
-        ret, frame = cap.read()
-        if not ret:
-            break
+    # 准备重采样索引
+    indices = None
+    if target_frames is not None:
+        indices = np.linspace(0, total_frames - 1, target_frames).astype(int)
+        print(f"Resampling video to {target_frames} frames.")
 
+    current_cap_idx = -1
+    last_valid_frame = None
+
+    def frame_generator():
+        nonlocal current_cap_idx, last_valid_frame
+        if indices is not None:
+            for t_idx in indices:
+                while current_cap_idx < t_idx:
+                    ret, frame = cap.read()
+                    if not ret:
+                        return
+                    current_cap_idx += 1
+                    last_valid_frame = frame
+                if current_cap_idx < t_idx: # Video ended early
+                    return
+                yield last_valid_frame
+        else:
+            while True:
+                ret, frame = cap.read()
+                if not ret:
+                    break
+                yield frame
+
+    frame_idx = 0
+    total_to_process = len(indices) if indices is not None else total_frames
+
+    for frame in frame_generator():
         # 1. 原分辨率 (缩放到 sub_w, sub_h 以便拼接)
         # 注意：这里其实是把原图缩小了一半显示。
         # 如果想保留原图细节，可能需要裁剪或者输出更大的视频。
@@ -104,11 +132,14 @@ def process_video():
 
         frame_idx += 1
         if frame_idx % 50 == 0:
-            print(f"Processed {frame_idx}/{total_frames} frames")
+            print(f"Processed {frame_idx}/{total_to_process} frames")
 
     cap.release()
     out.release()
     print(f"Done. Saved to {output_path}")
 
 if __name__ == "__main__":
-    process_video()
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--target_frames', type=int, default=64, help='Target number of frames')
+    args = parser.parse_args()
+    process_video(target_frames=args.target_frames)

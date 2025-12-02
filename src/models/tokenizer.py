@@ -10,16 +10,24 @@ class VisualActionTokenizer(nn.Module):
     """
     def __init__(self, 
                  img_size=128, 
+                 patch_size=16,
                  frames=16,
+                 in_chans=3,
                  embed_dim=768,
-                 num_queries=32):
+                 num_heads=12,
+                 num_queries=32,
+                 use_checkpoint=False):
         super().__init__()
         
         self.encoder = VisualActionEncoder(
             img_size=img_size,
+            patch_size=patch_size,
             frames=frames,
+            in_chans=in_chans,
             embed_dim=embed_dim,
-            num_queries=num_queries
+            num_heads=num_heads,
+            num_queries=num_queries,
+            use_checkpoint=use_checkpoint
         )
         
         # Decoder is a Diffusion Model
@@ -27,32 +35,44 @@ class VisualActionTokenizer(nn.Module):
         # The forward pass here might return the loss or the predicted noise.
         self.decoder = ActionReconstructionDecoder(
             input_size=num_queries,
-            in_channels=3, # Pixel space for simplicity in this demo
+            in_channels=in_chans, # Pixel space for simplicity in this demo
             hidden_size=embed_dim,
-            patch_size=16,
+            num_heads=num_heads,
+            patch_size=patch_size,
             img_size=img_size,
-            frames=frames
+            frames=frames,
+            use_checkpoint=use_checkpoint
         )
         
-    def forward(self, video, t=None):
+    def forward(self, video, t=None, noisy_video=None):
         """
         video: (B, C, T, H, W)
-        t: (B,) timesteps for diffusion training. If None, we might be in inference mode.
+        t: (B,) timesteps for diffusion training.
+        noisy_video: (B, C, T, H, W) - Optional, for training pass.
         """
+        # If training arguments are provided, perform the full denoising pass
+        if noisy_video is not None and t is not None:
+            return self.denoise(noisy_video, t, video)
+
         # 1. Encode
         z_action = self.encoder(video) # (B, N, D)
         
-        # 2. Decode (Training Step)
-        # In diffusion training, we sample noise and try to predict it (or x0).
-        # Here we assume the caller handles the noise addition and passes 'video' as the noisy input?
-        # Actually, usually the model forward takes x_noisy and t.
-        # But here we need to extract z_action from the CLEAN video (or a separate view),
-        # and then use it to denoise a NOISY version of the video.
-        
-        # For the purpose of this class, let's just return z_action and the decoder instance
-        # so the training loop can handle the diffusion logic (noise sampling).
+        # If t is provided, we could perform a denoising step here, 
+        # but typically the training loop handles noise addition and target generation.
+        # So we just return the action latents.
         
         return z_action
+
+    def denoise(self, noisy_video, t, context_video):
+        """
+        Perform one step of denoising.
+        noisy_video: (B, C, T, H, W)
+        t: (B,)
+        context_video: (B, C, T, H, W) - The clean video used to extract action latents
+        """
+        z_action = self.encoder(context_video)
+        pred_video = self.decoder(noisy_video, t, z_action)
+        return pred_video
 
     def get_action_latents(self, video):
         return self.encoder(video)
