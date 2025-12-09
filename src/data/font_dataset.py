@@ -38,8 +38,8 @@ class FontDataset(Dataset):
                 candidates = [d for d in os.listdir(data_root) if os.path.isdir(os.path.join(data_root, d))]
                 font_names = []
                 for d in candidates:
-                    # 简单的检查：是否存在对应的 json 和 pkl 文件
-                    if os.path.exists(os.path.join(data_root, d, f"{d}.json")) and \
+                    # 简单的检查：是否存在对应的 pkl 文件
+                    if os.path.exists(os.path.join(data_root, d, f"{d}_strokes.pkl")) and \
                        os.path.exists(os.path.join(data_root, d, f"{d}_imgs.pkl")):
                         font_names.append(d)
                 font_names.sort() # 排序以确保顺序一致
@@ -57,13 +57,13 @@ class FontDataset(Dataset):
         
         for font_name in self.font_names:
             font_dir = os.path.join(data_root, font_name)
-            json_path = os.path.join(font_dir, f"{font_name}.json")
+            strokes_path = os.path.join(font_dir, f"{font_name}_strokes.pkl")
             pkl_path = os.path.join(font_dir, f"{font_name}_imgs.pkl")
             
             try:
                 # 加载笔画数据
-                with open(json_path, 'r', encoding='utf-8') as f:
-                    strokes_data = json.load(f)
+                with open(strokes_path, 'rb') as f:
+                    strokes_data = pickle.load(f)
                 # 加载图像数据
                 with open(pkl_path, 'rb') as f:
                     images_data = pickle.load(f)

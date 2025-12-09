@@ -7,7 +7,6 @@ from PIL import Image
 from transformers import AutoProcessor
 
 from models.vla import Pi0VLA
-from data.traj_utils import recover_strokes
 
 def get_args():
     parser = argparse.ArgumentParser(description="Inference Pi0 VLA Model")
@@ -20,6 +19,14 @@ def get_args():
     parser.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
     parser.add_argument("--bf16", action="store_true", help="Use bfloat16 mixed precision")
     parser.add_argument("--fp16", action="store_true", help="Use fp16 mixed precision")
+    parser.add_argument("--num_action_tokens", type=int, default=8, help="Number of special action tokens to append")
+    
+    # LoRA arguments
+    parser.add_argument("--use_lora", action="store_true", help="Use LoRA")
+    parser.add_argument("--lora_rank", type=int, default=16, help="LoRA rank")
+    parser.add_argument("--lora_alpha", type=int, default=32, help="LoRA alpha")
+    parser.add_argument("--model_id", type=str, default="Qwen/Qwen3-VL-4B-Instruct", help="HuggingFace Model ID")
+
     return parser.parse_args()
 
 def main():
@@ -36,7 +43,7 @@ def main():
     print(f"Using device: {args.device}, dtype: {dtype}")
 
     # 1. Initialize Model
-    action_dim = args.num_points * 3
+    action_dim = args.num_points * 2
     
     print(f"Initializing model...")
     # Note: Pi0VLA hardcodes the VLM path.
@@ -52,8 +59,13 @@ def main():
         device_map = args.device
         
     model = Pi0VLA(
+        model_id=args.model_id,
         action_dim=action_dim,
+        num_action_tokens=args.num_action_tokens,
         freeze_vlm=True,
+        use_lora=args.use_lora,
+        lora_rank=args.lora_rank,
+        lora_alpha=args.lora_alpha,
         device_map=device_map,
         torch_dtype=dtype
     )
@@ -61,9 +73,8 @@ def main():
     # 2. Load Checkpoint
     print(f"Loading checkpoint from {args.checkpoint}...")
     if os.path.exists(args.checkpoint):
-        checkpoint = torch.load(args.checkpoint, map_location='cpu')
-        # The checkpoint only contains action_head state_dict
-        model.action_head.load_state_dict(checkpoint)
+        # Use the new load_checkpoint method
+        model.load_checkpoint(args.checkpoint)
     else:
         print(f"Error: Checkpoint {args.checkpoint} not found.")
         return
@@ -103,32 +114,28 @@ def main():
         }
     ]
     
-    text_prompt = processor.apply_chat_template(
+    text = processor.apply_chat_template(
         messages,
         tokenize=False,
         add_generation_prompt=True
     )
     
     inputs = processor(
-        text=[text_prompt],
+        text=[text],
         images=[image],
         padding=True,
         return_tensors="pt"
     )
-    
     inputs = {k: v.to(args.device) for k, v in inputs.items()}
     
     # 4. Inference
     print(f"Running inference with {args.steps} steps...")
     with torch.no_grad():
-        # generate_action returns [B, action_dim]
+        # generate_action returns list of tensors [num_points * 2]
         actions = model.generate_action(inputs, steps=args.steps)
         
-    action = actions[0].float().cpu().numpy()
-    
     # 5. Visualize
     print("Visualizing...")
-    strokes = recover_strokes(action, num_points=args.num_points)
     
     plt.figure(figsize=(12, 6))
     
@@ -143,8 +150,9 @@ def main():
     # Draw border
     plt.plot([-1, 1, 1, -1, -1], [-1, -1, 1, 1, -1], 'k--', alpha=0.5)
     
-    colors = plt.cm.jet(np.linspace(0, 1, len(strokes)))
-    for i, stroke in enumerate(strokes):
+    colors = plt.cm.jet(np.linspace(0, 1, len(actions)))
+    for i, action in enumerate(actions):
+        stroke = action.float().cpu().numpy().reshape(-1, 2)
         # Invert Y for visualization if needed, assuming -1 is top
         # Based on visualize_sample in font_dataset.py
         plt.plot(stroke[:, 0], -stroke[:, 1], label=f'Stroke {i+1}', color=colors[i])

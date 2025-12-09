@@ -164,11 +164,11 @@ def process_font(font_file, source_root, dest_root):
                 all_font_data[key] = strokes
                 all_image_data[key] = img_data
 
-    # 保存所有数据到一个json文件
+    # 保存所有数据到一个pkl文件
     if all_font_data:
-        json_path = os.path.join(dest_dir, f"{font_name}.json")
-        with open(json_path, 'w') as f:
-            json.dump(all_font_data, f)
+        pkl_strokes_path = os.path.join(dest_dir, f"{font_name}_strokes.pkl")
+        with open(pkl_strokes_path, 'wb') as f:
+            pickle.dump(all_font_data, f)
 
     # 保存所有图片到一个pkl文件
     if all_image_data:
