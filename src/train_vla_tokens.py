@@ -51,7 +51,7 @@ class TokenVLACollate:
         if self.processor.tokenizer.convert_tokens_to_ids(stop_token) == self.processor.tokenizer.unk_token_id:
             raise ValueError("Stop token <|stop|> missing from tokenizer. Ensure Pi0VLA initializes special tokens before building the dataloader.")
         for key, tokens, image in zip(keys, token_lists, images):
-            prompt = f"Write the character: {key}"
+            prompt = f"Write the character"
             messages = [
                 {
                     "role": "user",
@@ -102,13 +102,13 @@ def get_args():
     parser.add_argument("--tokens_per_stroke", type=int, default=3)
     parser.add_argument("--num_points", type=int, default=24, help="Number of points per stroke (matches VQ-VAE)")
     parser.add_argument("--batch_size", type=int, default=8)
-    parser.add_argument("--epochs", type=int, default=50)
+    parser.add_argument("--epochs", type=int, default=100)
     parser.add_argument("--lr", type=float, default=1e-4)
-    parser.add_argument("--save_dir", type=str, default="checkpoints/token_stage")
+    parser.add_argument("--save_dir", type=str, default="/data1/jizy/checkpoints/token_stage")
     parser.add_argument("--stage", choices=["lm", "action"], default="lm", help="lm: finetune VLM on tokens; action: freeze VLM and train heads")
     parser.add_argument("--use_lora", action="store_true")
-    parser.add_argument("--lora_rank", type=int, default=16)
-    parser.add_argument("--lora_alpha", type=int, default=32)
+    parser.add_argument("--lora_rank", type=int, default=32)
+    parser.add_argument("--lora_alpha", type=int, default=64)
     parser.add_argument("--lora_dropout", type=float, default=0.05)
     parser.add_argument("--gradient_accumulation_steps", type=int, default=1)
     parser.add_argument("--fp16", action="store_true")
@@ -136,9 +136,68 @@ def get_free_gpus(threshold_mb: int = 512):
         print(f"Could not query GPUs: {e}")
         return []
 
+def validate_lm_stage(model, processor, dataset, args, epoch_idx: int, rank: int = 0):
+    """
+    Validation function for the LM stage.
+    Samples a batch of data, runs a forward pass, and calculates token prediction accuracy.
+    """
+    # 仅在主进程打印
+    if rank != 0:
+        return
+
+    # 获取未封装的 model (处理 DDP 情况)
+    model_to_eval = model.module if hasattr(model, "module") else model
+    model_to_eval.eval()
+
+    # 随机采样一个 batch (使用 args.batch_size 或固定数量，例如 4)
+    num_samples = min(args.batch_size, 8)  # 限制最大验证 batch 为 8 以防 OOM
+    indices = torch.randperm(len(dataset))[:num_samples].tolist()
+    batch_samples = [dataset[i] for i in indices]
+
+    # 复用 TokenVLACollate 来处理 chat 模板、token 拼接和 label masking (-100)
+    collate = TokenVLACollate(processor, tokens_per_stroke=args.tokens_per_stroke, include_labels=True)
+
+    try:
+        # 预处理数据
+        inputs, _, _ = collate(batch_samples)
+        device = next(model_to_eval.parameters()).device
+        inputs = {k: v.to(device) if isinstance(v, torch.Tensor) else v for k, v in inputs.items()}
+
+        with torch.no_grad():
+            # 直接调用内部的 vlm 获取 logits
+            outputs = model_to_eval.vlm(**inputs, return_dict=True)
+            logits = outputs.logits  # [B, Seq_Len, Vocab_Size]
+
+        if "labels" in inputs:
+            labels = inputs["labels"]
+            preds = torch.argmax(logits, dim=-1)
+
+            # 计算准确率: 忽略 label 为 -100 的部分 (prompt 和 padding)
+            mask = labels != -100
+            # print labels and preds for debugging
+            print(f"Labels: {labels[0]}")
+            print(f"Preds: {preds[0]}")
+            if mask.any():
+                correct = (preds[mask] == labels[mask]).sum()
+                total = mask.sum()
+                acc = (correct.float() / total.float()).item()
+                print(f"*** [Epoch {epoch_idx + 1}] LM Stage Validation (n={num_samples}) ***")
+                print(f"    Token Accuracy: {acc:.4f}")
+                
+                # 可选：打印一段解码结果作为直观参考
+                # decode_ids = preds[0][mask[0]]
+                # print(f"    Sample Pred: {processor.tokenizer.decode(decode_ids, skip_special_tokens=False)}")
+            else:
+                print(f"[Epoch {epoch_idx + 1}] LM Valid: No valid labels found for accuracy calculation.")
+    
+    except Exception as e:
+        print(f"LM Validation failed: {e}")
+
+    # 恢复训练模式
+    model_to_eval.train()
 
 def visualize_action_stage(model, processor, dataset, args, epoch_idx: int, rank: int = 0):
-    """Runs a quick teacher-forced visualization for the action stage."""
+    """Runs an inference-style visualization for the action stage using autoregressive generation."""
     if len(dataset) == 0:
         return
 
@@ -148,80 +207,76 @@ def visualize_action_stage(model, processor, dataset, args, epoch_idx: int, rank
     sample_idx = epoch_idx % len(dataset)
     sample = dataset[sample_idx]
 
-    collate = TokenVLACollate(processor, tokens_per_stroke=args.tokens_per_stroke, include_labels=False)
+    # Compute token accuracy in a teacher-forced pass (masked like training)
+    acc_token = float("nan")
+    collate_labels = TokenVLACollate(processor, tokens_per_stroke=args.tokens_per_stroke, include_labels=True)
     try:
-        inputs, actions, centers = collate([sample])
-    except ValueError:
-        model_to_use.train()
-        return
+        inputs_gt, _, _ = collate_labels([sample])
+        inputs_gt = {k: v.to(next(model_to_use.parameters()).device) if isinstance(v, torch.Tensor) else v for k, v in inputs_gt.items()}
+        with torch.no_grad():
+            outputs_gt = model_to_use.vlm(**inputs_gt, return_dict=True)
+        if "labels" in inputs_gt:
+            labels = inputs_gt["labels"]
+            print(f"GT Labels: {labels}")
+            logits = outputs_gt.logits
+            with torch.no_grad():
+                shift_logits = logits[..., :-1, :].contiguous()
+                shift_labels = labels[..., 1:].contiguous()
 
-    if actions is None or actions.numel() == 0:
-        model_to_use.train()
-        return
+                preds = torch.argmax(shift_logits, dim=-1)
+                print(f"Preds: {preds}")
+                mask = shift_labels != -100
+
+                if mask.any():
+                    acc_token = (preds[mask] == shift_labels[mask]).float().mean().item()
+                else:
+                    acc_token = 0.0
+    except Exception as e:
+        if rank == 0:
+            print(f"Token accuracy computation failed: {e}")
 
     device = next(model_to_use.parameters()).device
-    inputs = {k: v.to(device) if isinstance(v, torch.Tensor) else v for k, v in inputs.items()}
-    actions = actions.to(device)
-    centers = centers.to(device) if centers is not None and centers.numel() > 0 else None
-
-    with torch.no_grad():
-        outputs = model_to_use.vlm(**inputs, output_hidden_states=True, return_dict=True)
-
-    input_ids = inputs["input_ids"]
-    last_hidden_state = outputs.hidden_states[-1]
-
-    if model_to_use.code_token_ids:
-        token_mask = torch.zeros_like(input_ids, dtype=torch.bool)
-        for tid in model_to_use.code_token_ids:
-            token_mask |= input_ids == tid
-        tokens_per_stroke = model_to_use.tokens_per_stroke
-    else:
-        stroke_token_id = processor.tokenizer.convert_tokens_to_ids(model_to_use.stroke_token)
-        token_mask = input_ids == stroke_token_id
-        tokens_per_stroke = 1
-
-    token_embeddings = last_hidden_state[token_mask]
-    if token_embeddings.numel() == 0:
-        model_to_use.train()
-        return
-
-    expected_tokens = actions.shape[0] * tokens_per_stroke
-    if token_embeddings.shape[0] < expected_tokens:
-        max_strokes = token_embeddings.shape[0] // tokens_per_stroke
-        actions = actions[:max_strokes]
-        if centers is not None:
-            centers = centers[:max_strokes]
-        token_embeddings = token_embeddings[: max_strokes * tokens_per_stroke]
-    elif token_embeddings.shape[0] > expected_tokens:
-        token_embeddings = token_embeddings[:expected_tokens]
-
-    if token_embeddings.numel() == 0 or actions.numel() == 0:
-        model_to_use.train()
-        return
-
-    token_embeddings = token_embeddings.view(-1, tokens_per_stroke, token_embeddings.shape[-1]).mean(dim=1)
-    head_dtype = next(model_to_use.center_head.parameters()).dtype
-    token_embeddings = token_embeddings.to(head_dtype)
-
-    with torch.no_grad():
-        pred_actions = model_to_use.sample_flow_matching(token_embeddings, steps=args.inference_steps)
-        pred_centers = model_to_use.center_head(token_embeddings)
-
-    pred_actions = pred_actions.view(-1, args.num_points, 2)
-    pred_centers = pred_centers.view(-1, 1, 2)
-    pred_strokes = (pred_actions + pred_centers).cpu().numpy()
-
-    gt_strokes = actions.view(-1, args.num_points, 2)
-    if centers is not None:
-        centers = centers.view(-1, 1, 2)
-        gt_strokes = gt_strokes + centers
-    gt_strokes = gt_strokes.cpu().numpy()
-
     image = sample["image"]
-    if isinstance(image, torch.Tensor):
-        image_np = image.permute(1, 2, 0).cpu().numpy()
-    else:
-        image_np = np.array(image)
+    key = sample.get("key", "?")
+
+    prompt = f"Write the character"
+    messages = [
+        {
+            "role": "user",
+            "content": [
+                {"type": "image", "image": image},
+                {"type": "text", "text": prompt},
+            ],
+        }
+    ]
+    chat_prompt = processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+    inputs = processor(text=[chat_prompt], images=[image], padding=True, return_tensors="pt")
+    inputs = {k: v.to(device) if isinstance(v, torch.Tensor) else v for k, v in inputs.items()}
+
+    max_strokes = 32
+
+    with torch.no_grad():
+        generated = model_to_use.generate_action(inputs, max_strokes=max_strokes, steps=args.inference_steps)
+
+    if not generated:
+        model_to_use.train()
+        return
+
+    pred_actions = torch.cat(generated, dim=0)
+    pred_strokes = pred_actions.view(-1, args.num_points, 2).cpu().numpy()
+
+    gt_strokes = []
+    gt_actions = sample.get("strokes_centered")
+    gt_centers = sample.get("centers")
+    if isinstance(gt_actions, torch.Tensor) and gt_actions.numel() > 0:
+        gt_actions_view = gt_actions.view(-1, args.num_points, 2)
+        if isinstance(gt_centers, torch.Tensor) and gt_centers.numel() > 0:
+            gt_centers_view = gt_centers.view(-1, 1, 2)
+            gt_strokes = (gt_actions_view + gt_centers_view).cpu().numpy()
+        else:
+            gt_strokes = gt_actions_view.cpu().numpy()
+
+    image_np = image.permute(1, 2, 0).cpu().numpy() if isinstance(image, torch.Tensor) else np.array(image)
 
     def _plot_strokes(ax, strokes, title):
         if len(strokes) == 0:
@@ -240,7 +295,7 @@ def visualize_action_stage(model, processor, dataset, args, epoch_idx: int, rank
 
     fig, axes = plt.subplots(1, 3, figsize=(13, 4))
     axes[0].imshow(image_np)
-    axes[0].set_title(f"Input: {sample['key']}")
+    axes[0].set_title(f"Input: {key}")
     axes[0].axis("off")
     _plot_strokes(axes[1], gt_strokes, "Ground Truth")
     _plot_strokes(axes[2], pred_strokes, "Predicted")
@@ -257,7 +312,7 @@ def visualize_action_stage(model, processor, dataset, args, epoch_idx: int, rank
     plt.close(fig)
 
     if rank == 0:
-        print(f"Saved action-stage visualization to {vis_path}")
+        print(f"Saved action-stage visualization to {vis_path}; token accuracy={acc_token:.4f}")
 
     model_to_use.train()
 
@@ -305,6 +360,15 @@ def train_worker(rank: int, world_size: int, args):
         use_gradient_checkpointing=args.gradient_checkpointing,
     )
     model.to(device)
+
+    if args.stage == "action":
+        lm_ckpt = os.path.join(args.save_dir, "token_stage_lm.pt")
+        if os.path.exists(lm_ckpt):
+            model.load_checkpoint(lm_ckpt)
+            if rank == 0:
+                print(f"Loaded LM-stage checkpoint from {lm_ckpt}")
+        elif rank == 0:
+            print(f"LM-stage checkpoint not found at {lm_ckpt}; training action stage from scratch.")
 
     # Stage-specific trainables
     if args.stage == "lm":
@@ -406,6 +470,8 @@ def train_worker(rank: int, world_size: int, args):
             ckpt = os.path.join(args.save_dir, f"token_stage_{args.stage}.pt")
             model.module.save_checkpoint(ckpt)
             print(f"Epoch {epoch+1} avg_loss={avg_loss:.4f}, avg_loss_vlm={avg_loss_vlm:.4f}, avg_loss_action={avg_loss_action:.4f}, avg_loss_center={avg_loss_center:.4f}, saved {ckpt}")
+            if args.stage == "lm":
+                validate_lm_stage(model, processor, dataset, args, epoch, rank)
             if args.stage == "action":
                 visualize_action_stage(model, processor, dataset, args, epoch, rank)
 
@@ -426,130 +492,6 @@ def main():
             print(f"Launching DDP with GPUs: {free_gpus}")
             mp.spawn(train_worker, args=(world_size, args), nprocs=world_size)
             return
-
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-
-    dataset = TokenDataset(
-        data_root=args.data_root,
-        tokens_per_stroke=args.tokens_per_stroke,
-        split="train",
-    )
-    if not (0 < args.train_ratio <= 1.0):
-        raise ValueError("train_ratio must be in (0, 1].")
-    if args.train_ratio < 1.0:
-        total = len(dataset)
-        subset = int(total * args.train_ratio)
-        indices = torch.randperm(total)[:subset]
-        dataset = torch.utils.data.Subset(dataset, indices.tolist())
-
-    dtype = torch.bfloat16 if args.bf16 else (torch.float16 if args.fp16 else torch.float32)
-
-    model = Pi0VLA(
-        model_id=args.model_id,
-        action_dim=args.num_points * 2,
-        num_action_tokens=args.tokens_per_stroke,
-        codebook_size=args.codebook_size,
-        tokens_per_stroke=args.tokens_per_stroke,
-        freeze_vlm=False,
-        use_lora=args.use_lora,
-        lora_rank=args.lora_rank,
-        lora_alpha=args.lora_alpha,
-        lora_dropout=args.lora_dropout,
-        torch_dtype=dtype,
-        device_map={"": 0} if device.type == "cuda" else "cpu",
-        use_gradient_checkpointing=args.gradient_checkpointing,
-    )
-    model.to(device)
-
-    # Stage-specific trainables
-    if args.stage == "lm":
-        for p in model.action_head.parameters():
-            p.requires_grad = False
-        for p in model.center_head.parameters():
-            p.requires_grad = False
-    else:  # action stage: allow VLM finetuning
-        if not args.use_lora:
-            for p in model.vlm.parameters():
-                p.requires_grad = True
-
-    processor = model.processor
-    if processor is None:
-        raise RuntimeError("Processor failed to load inside Pi0VLA; cannot proceed with tokenization.")
-
-    collate = TokenVLACollate(processor, tokens_per_stroke=args.tokens_per_stroke, include_labels=True)
-    loader = DataLoader(dataset, batch_size=args.batch_size, shuffle=True, num_workers=args.num_workers, collate_fn=collate, pin_memory=True)
-
-    params = [p for p in model.parameters() if p.requires_grad]
-    optimizer = AdamW(params, lr=args.lr)
-    scaler = torch.cuda.amp.GradScaler(enabled=args.fp16)
-
-    os.makedirs(args.save_dir, exist_ok=True)
-
-    for epoch in range(args.epochs):
-        model.train()
-        progress = tqdm(loader, desc=f"Epoch {epoch+1}/{args.epochs}")
-        total_loss = 0.0
-        total_loss_vlm = 0.0
-        total_loss_action = 0.0
-        total_loss_center = 0.0
-
-        for step, (inputs, actions, centers) in enumerate(progress):
-            inputs = {k: v.to(device) if isinstance(v, torch.Tensor) else v for k, v in inputs.items()}
-            if args.stage == "lm":
-                actions = None
-                centers = None
-            else:
-                if actions is not None:
-                    actions = actions.to(device)
-                    if actions.numel() == 0:
-                        continue
-                if centers is not None and centers.numel() > 0:
-                    centers = centers.to(device)
-                else:
-                    centers = None
-
-            optimizer.zero_grad()
-            with torch.cuda.amp.autocast(dtype=dtype, enabled=args.fp16 or args.bf16):
-                loss_out = model(inputs, actions=actions, centers=centers)
-                if isinstance(loss_out, tuple):
-                    loss, loss_dict = loss_out
-                else:
-                    loss = loss_out
-                    loss_dict = {"loss_vlm": loss.item(), "loss_action": 0.0, "loss_center": 0.0}
-                loss = loss / args.gradient_accumulation_steps
-            scaler.scale(loss).backward()
-
-            if (step + 1) % args.gradient_accumulation_steps == 0:
-                scaler.step(optimizer)
-                scaler.update()
-                optimizer.zero_grad()
-
-            loss_scalar = loss.item() * args.gradient_accumulation_steps
-            total_loss += loss_scalar
-            total_loss_vlm += loss_dict.get("loss_vlm", 0.0) * args.gradient_accumulation_steps
-            total_loss_action += loss_dict.get("loss_action", 0.0) * args.gradient_accumulation_steps
-            total_loss_center += loss_dict.get("loss_center", 0.0) * args.gradient_accumulation_steps
-            progress.set_postfix({
-                "loss": loss_scalar,
-                "loss_vlm": loss_dict.get("loss_vlm", 0.0),
-                "loss_action": loss_dict.get("loss_action", 0.0),
-                "loss_center": loss_dict.get("loss_center", 0.0),
-            })
-
-        denom = max(1, len(loader))
-        avg_loss = total_loss / denom
-        avg_loss_vlm = total_loss_vlm / denom
-        avg_loss_action = total_loss_action / denom
-        avg_loss_center = total_loss_center / denom
-        ckpt = os.path.join(args.save_dir, f"token_stage_{args.stage}.pt")
-        model.save_checkpoint(ckpt)
-        print(
-            f"Epoch {epoch+1} avg_loss={avg_loss:.4f}, avg_loss_vlm={avg_loss_vlm:.4f}, "
-            f"avg_loss_action={avg_loss_action:.4f}, avg_loss_center={avg_loss_center:.4f}, saved {ckpt}"
-        )
-        if args.stage == "action":
-            visualize_action_stage(model, processor, dataset, args, epoch)
-
 
 if __name__ == "__main__":
     main()

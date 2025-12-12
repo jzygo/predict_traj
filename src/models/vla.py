@@ -369,14 +369,14 @@ class Pi0VLA(nn.Module):
             self.vlm.load_state_dict(checkpoint['vlm'], strict=False)
             print("Successfully loaded VLM weights from checkpoint.")
 
-        if 'tokenizer_added_vocab' in checkpoint and self.processor is not None:
-            added = checkpoint['tokenizer_added_vocab']
-            # This call is idempotent; tokenizer will not duplicate tokens
-            self.processor.tokenizer.add_tokens(list(added.keys()), special_tokens=True)
-            self.vlm.resize_token_embeddings(len(self.processor.tokenizer))
-            if self.codebook_size > 0:
-                code_tokens = [f"{self.code_token_prefix}{i:04d}|>" for i in range(self.codebook_size)]
-                self.code_token_ids = [self.processor.tokenizer.convert_tokens_to_ids(t) for t in code_tokens]
+        # if 'tokenizer_added_vocab' in checkpoint and self.processor is not None:
+        #     added = checkpoint['tokenizer_added_vocab']
+        #     # This call is idempotent; tokenizer will not duplicate tokens
+        #     self.processor.tokenizer.add_tokens(list(added.keys()), special_tokens=True)
+        #     self.vlm.resize_token_embeddings(len(self.processor.tokenizer))
+        #     if self.codebook_size > 0:
+        #         code_tokens = [f"{self.code_token_prefix}{i:04d}|>" for i in range(self.codebook_size)]
+        #         self.code_token_ids = [self.processor.tokenizer.convert_tokens_to_ids(t) for t in code_tokens]
 
     def forward(self, inputs, actions=None, centers=None):
         """
@@ -528,6 +528,8 @@ class Pi0VLA(nn.Module):
         stop_ids = {eos_token_id}
         if stop_token_id >= 0:
             stop_ids.add(stop_token_id)
+
+        print(f"Stop token IDs: {stop_ids}")
         
         # 1. Pre-fill
         outputs = self.vlm(
@@ -549,10 +551,13 @@ class Pi0VLA(nn.Module):
             attention_mask = torch.cat([attention_mask, torch.ones((attention_mask.shape[0], 1), device=device)], dim=1)
 
         token_buffer = []
-        max_tokens = max_strokes * tokens_per_stroke + 8
+        max_tokens = max_strokes * tokens_per_stroke
+
+        token_id_list = []
 
         for _ in range(max_tokens):
             token_id = curr_input_ids[0, 0].item()
+            token_id_list.append(token_id)
             if token_id in stop_ids:
                 break
 
@@ -587,13 +592,18 @@ class Pi0VLA(nn.Module):
 
                     generated_strokes.append(stroke.cpu())
 
+                    if len(generated_strokes) >= max_strokes:
+                        break
+
             next_token_logits = outputs.logits[:, -1, :]
             next_token_id = torch.argmax(next_token_logits, dim=-1)
 
             curr_input_ids = next_token_id.unsqueeze(1)
             if attention_mask is not None:
                 attention_mask = torch.cat([attention_mask, torch.ones((attention_mask.shape[0], 1), device=device)], dim=1)
-                
+        
+        print(f"Predicted token IDs: {token_id_list}")
+
         return generated_strokes
 
     def sample_flow_matching(self, cond, steps=10):
