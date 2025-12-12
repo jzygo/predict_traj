@@ -138,63 +138,219 @@ def get_free_gpus(threshold_mb: int = 512):
 
 def validate_lm_stage(model, processor, dataset, args, epoch_idx: int, rank: int = 0):
     """
-    Validation function for the LM stage.
-    Samples a batch of data, runs a forward pass, and calculates token prediction accuracy.
+    Enhanced validation function for the LM stage with autoregressive generation.
+    
+    Features:
+    1. Teacher-forcing validation (original)
+    2. Autoregressive token generation
+    3. Scheduled sampling with ground truth prefix
     """
-    # 仅在主进程打印
     if rank != 0:
         return
 
-    # 获取未封装的 model (处理 DDP 情况)
     model_to_eval = model.module if hasattr(model, "module") else model
     model_to_eval.eval()
 
-    # 随机采样一个 batch (使用 args.batch_size 或固定数量，例如 4)
-    num_samples = min(args.batch_size, 8)  # 限制最大验证 batch 为 8 以防 OOM
+    num_samples = min(args.batch_size, 4)
     indices = torch.randperm(len(dataset))[:num_samples].tolist()
     batch_samples = [dataset[i] for i in indices]
 
-    # 复用 TokenVLACollate 来处理 chat 模板、token 拼接和 label masking (-100)
     collate = TokenVLACollate(processor, tokens_per_stroke=args.tokens_per_stroke, include_labels=True)
 
     try:
-        # 预处理数据
+        # ========== Part 1: Teacher-Forcing Validation ==========
         inputs, _, _ = collate(batch_samples)
         device = next(model_to_eval.parameters()).device
         inputs = {k: v.to(device) if isinstance(v, torch.Tensor) else v for k, v in inputs.items()}
 
         with torch.no_grad():
-            # 直接调用内部的 vlm 获取 logits
             outputs = model_to_eval.vlm(**inputs, return_dict=True)
-            logits = outputs.logits  # [B, Seq_Len, Vocab_Size]
+            logits = outputs.logits
 
         if "labels" in inputs:
             labels = inputs["labels"]
             preds = torch.argmax(logits, dim=-1)
-
-            # 计算准确率: 忽略 label 为 -100 的部分 (prompt 和 padding)
             mask = labels != -100
-            # print labels and preds for debugging
-            print(f"Labels: {labels[0]}")
-            print(f"Preds: {preds[0]}")
+
             if mask.any():
                 correct = (preds[mask] == labels[mask]).sum()
                 total = mask.sum()
                 acc = (correct.float() / total.float()).item()
-                print(f"*** [Epoch {epoch_idx + 1}] LM Stage Validation (n={num_samples}) ***")
-                print(f"    Token Accuracy: {acc:.4f}")
+                print(f"\n{'='*60}")
+                print(f"[Epoch {epoch_idx + 1}] LM Stage Validation (Teacher-Forcing)")
+                print(f"{'='*60}")
+                print(f"Samples: {num_samples} | Token Accuracy: {acc:.4f}")
+
+        # ========== Part 2: Autoregressive Generation ==========
+        print(f"\n{'='*60}")
+        print(f"[Epoch {epoch_idx + 1}] LM Stage Autoregressive Generation")
+        print(f"{'='*60}")
+        
+        # Test with different GT prefix lengths
+        # N=0: pure generation, N>0: use first N GT tokens
+        prefix_lengths = [0, 3, 5, 10]
+        
+        for sample_idx, sample in enumerate(batch_samples[:2]):  # Test 2 samples
+            print(f"\n--- Sample {sample_idx + 1} ---")
+            
+            # Get ground truth tokens
+            gt_tokens = sample["tokens"]
+            flat_gt_tokens = [code for stroke in gt_tokens for code in stroke]
+            gt_token_ids = [processor.tokenizer.convert_tokens_to_ids(code_token_str(t)) for t in flat_gt_tokens]
+            
+            print(f"GT Tokens ({len(flat_gt_tokens)}): {flat_gt_tokens[:20]}{'...' if len(flat_gt_tokens) > 20 else ''}")
+            
+            for prefix_len in prefix_lengths:
+                if prefix_len > len(flat_gt_tokens):
+                    continue
+                    
+                gen_tokens = autoregressive_generate_tokens(
+                    model_to_eval, 
+                    processor, 
+                    sample, 
+                    gt_token_ids,
+                    prefix_len=prefix_len,
+                    max_tokens=len(flat_gt_tokens) + 10,
+                    device=device
+                )
                 
-                # 可选：打印一段解码结果作为直观参考
-                # decode_ids = preds[0][mask[0]]
-                # print(f"    Sample Pred: {processor.tokenizer.decode(decode_ids, skip_special_tokens=False)}")
-            else:
-                print(f"[Epoch {epoch_idx + 1}] LM Valid: No valid labels found for accuracy calculation.")
+                # Calculate accuracy
+                min_len = min(len(gen_tokens), len(flat_gt_tokens))
+                if min_len > 0:
+                    matches = sum(1 for i in range(min_len) if gen_tokens[i] == flat_gt_tokens[i])
+                    acc = matches / min_len
+                else:
+                    acc = 0.0
+                
+                print(f"  Prefix N={prefix_len:2d} | Generated: {len(gen_tokens):3d} tokens | Accuracy: {acc:.4f}")
+                if prefix_len == 0:
+                    print(f"    Gen: {gen_tokens[:20]}{'...' if len(gen_tokens) > 20 else ''}")
     
     except Exception as e:
         print(f"LM Validation failed: {e}")
+        import traceback
+        traceback.print_exc()
 
-    # 恢复训练模式
     model_to_eval.train()
+
+
+def autoregressive_generate_tokens(model, processor, sample, gt_token_ids, prefix_len=0, max_tokens=100, device="cuda"):
+    """
+    Autoregressively generate code tokens with optional GT prefix forcing.
+    
+    Args:
+        model: The VLA model
+        processor: Tokenizer processor
+        sample: Single data sample
+        gt_token_ids: Ground truth token IDs (list of ints)
+        prefix_len: Number of GT tokens to force at the beginning (N)
+        max_tokens: Maximum number of tokens to generate
+        device: Device to run on
+        
+    Returns:
+        List of generated token indices (not token IDs, but the code indices 0-511)
+    """
+    image = sample["image"]
+    prompt = "Write the character"
+    messages = [
+        {
+            "role": "user",
+            "content": [
+                {"type": "image", "image": image},
+                {"type": "text", "text": prompt},
+            ],
+        }
+    ]
+    
+    # Prepare initial input
+    chat_prompt = processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+    inputs = processor(text=[chat_prompt], images=[image], padding=True, return_tensors="pt")
+    inputs = {k: v.to(device) if isinstance(v, torch.Tensor) else v for k, v in inputs.items()}
+    
+    input_ids = inputs['input_ids']
+    attention_mask = inputs.get('attention_mask', None)
+    pixel_values = inputs.get('pixel_values', None)
+    image_grid_thw = inputs.get('image_grid_thw', None)
+    
+    # Get code token IDs range
+    code_token_ids = [processor.tokenizer.convert_tokens_to_ids(code_token_str(i)) for i in range(512)]
+    code_id_to_idx = {tid: i for i, tid in enumerate(code_token_ids)}
+    
+    stop_token_id = processor.tokenizer.convert_tokens_to_ids("<|stop|>")
+    eos_token_id = processor.tokenizer.eos_token_id
+    stop_ids = {stop_token_id, eos_token_id}
+    
+    # Pre-fill
+    outputs = model.vlm(
+        input_ids=input_ids,
+        attention_mask=attention_mask,
+        pixel_values=pixel_values,
+        image_grid_thw=image_grid_thw,
+        use_cache=True,
+        return_dict=True
+    )
+    
+    past_key_values = outputs.past_key_values
+    next_token_logits = outputs.logits[:, -1, :]
+    
+    # Start generation
+    generated_tokens = []
+    curr_token_id = None
+    
+    for step in range(max_tokens):
+        # Decide whether to use GT or generate
+        if step < prefix_len and step < len(gt_token_ids):
+            # Force GT token
+            curr_token_id = gt_token_ids[step]
+            is_forced = True
+        else:
+            # Generate next token
+            if step == 0:
+                # First token from pre-fill
+                curr_token_id = torch.argmax(next_token_logits, dim=-1).item()
+            else:
+                # Already updated from previous iteration
+                pass
+            is_forced = False
+        
+        # Check if stop
+        if curr_token_id in stop_ids:
+            break
+        
+        # Record if it's a code token
+        if curr_token_id in code_id_to_idx:
+            generated_tokens.append(code_id_to_idx[curr_token_id])
+        
+        # Prepare next input
+        curr_input_ids = torch.tensor([[curr_token_id]], device=device)
+        
+        if attention_mask is not None:
+            attention_mask = torch.cat([
+                attention_mask, 
+                torch.ones((attention_mask.shape[0], 1), device=device, dtype=attention_mask.dtype)
+            ], dim=1)
+        
+        # Forward pass
+        outputs = model.vlm(
+            input_ids=curr_input_ids,
+            attention_mask=attention_mask,
+            past_key_values=past_key_values,
+            use_cache=True,
+            return_dict=True
+        )
+        
+        past_key_values = outputs.past_key_values
+        next_token_logits = outputs.logits[:, -1, :]
+        
+        # Get next token for next iteration
+        curr_token_id = torch.argmax(next_token_logits, dim=-1).item()
+    
+    return generated_tokens
+
+
+def code_token_str(idx: int) -> str:
+    """Helper function to format code token string."""
+    return f"<|code_{idx:04d}|>"
 
 def visualize_action_stage(model, processor, dataset, args, epoch_idx: int, rank: int = 0):
     """Runs an inference-style visualization for the action stage using autoregressive generation."""
