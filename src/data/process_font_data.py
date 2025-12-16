@@ -53,8 +53,8 @@ def normalize_points(points, width, height):
     for x, y in points:
         # 假设 (0,0) 是左上角，x向右增加，y向下增加
         # 归一化公式: (val / max_val) * 2 - 1
-        nx = (x / width) * 2 - 1
-        ny = (y / height) * 2 - 1
+        nx = (x / max(width, height)) * 2 - 1
+        ny = (y / max(width, height)) * 2 - 1
         normalized.append([nx, ny])
     return normalized
 
@@ -96,12 +96,9 @@ def process_single_char(char_id, txt_files, font_dir):
             txt_path = os.path.join(font_dir, txt_file)
             points = get_points_from_txt(txt_path)
             
-            # 对每个txt文件里的线条提升五倍点的采样率
-            upsampled = upsample_points(points, factor=5)
-            
             # 将同一id下的所有点的坐标按.bmp文件图片分辨率缩放到[-1,1]区间内
-            normalized = normalize_points(upsampled, width, height)
-            all_strokes.append(normalized)
+            # normalized = normalize_points(points, width, height)
+            all_strokes.append(points)
         
         # 收集数据
         return (f"GB{char_id}", all_strokes, image_data)
@@ -113,6 +110,9 @@ def process_single_char(char_id, txt_files, font_dir):
 def process_font(font_file, source_root, dest_root):
     font_name = os.path.splitext(os.path.basename(font_file))[0]
     font_dir = os.path.join(source_root, font_name, font_name)
+
+    # if font_name != "FZHAOTJW":
+    #     return
     
     # 如果没有同名无后缀文件夹，则跳过
     if not os.path.isdir(font_dir):
@@ -127,6 +127,9 @@ def process_font(font_file, source_root, dest_root):
     # 文件名格式: GB{id}_{stroke}M.txt
     files = os.listdir(font_dir)
     id_map = {} # id -> list of txt files
+    if len(files) < 10:
+        font_dir = os.path.join(source_root, font_name, font_name, "GB6763-user")
+        files = os.listdir(font_dir)
     
     for f in files:
         if f.endswith('M.txt') and f.startswith('GB'):
