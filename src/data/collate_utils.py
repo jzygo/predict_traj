@@ -10,7 +10,7 @@ def center(stroke: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
     return stroke - center_pt, center_pt
 
 
-def resample_and_stack(strokes: List[torch.Tensor], num_points: int) -> Tuple[torch.Tensor, torch.Tensor]:
+def resample_and_stack(strokes: List[torch.Tensor], num_points: int, point_dim: int = 3) -> Tuple[torch.Tensor, torch.Tensor]:
     merged_strokes = []
     max_points_per_stroke = 0
     for i, s in enumerate(strokes):
@@ -28,14 +28,14 @@ def resample_and_stack(strokes: List[torch.Tensor], num_points: int) -> Tuple[to
     resampled = []
     for s in merged_strokes:
         max_points_per_stroke = max(max_points_per_stroke, len(s))
-        resampled.append(resample_stroke(s, num_points=num_points).view(-1, 2))
+        resampled.append(resample_stroke(s, num_points=num_points, point_dim=point_dim))
     if len(resampled) == 0:
-        return torch.zeros(0, num_points, 2), torch.zeros(0, 2)
+        return torch.zeros(0, num_points, point_dim), torch.zeros(0, point_dim)
     stacked = torch.stack(resampled, dim=0)
     return stacked, max_points_per_stroke
 
 
-def pad_stroke_batch(batch: List[Dict], num_points: int, max_strokes: int) -> Dict[str, torch.Tensor]:
+def pad_stroke_batch(batch: List[Dict], num_points: int, max_strokes: int, point_dim: int = 3) -> Dict[str, torch.Tensor]:
     images = torch.stack([item["image"] for item in batch])
     all_resampled = []
     all_masks = []
@@ -43,14 +43,14 @@ def pad_stroke_batch(batch: List[Dict], num_points: int, max_strokes: int) -> Di
     max_points_per_stroke = 0
     for item in batch:
         strokes = item["strokes"]
-        resampled, cur_max_points = resample_and_stack(strokes, num_points)
+        resampled, cur_max_points = resample_and_stack(strokes, num_points, point_dim=point_dim)
         max_points_per_stroke = max(max_points_per_stroke, cur_max_points)
         cur_len = resampled.size(0)
         lengths.append(cur_len)
 
         pad_len = max_strokes - cur_len
         if pad_len > 0:
-            pad = torch.zeros(pad_len, num_points, 2)
+            pad = torch.zeros(pad_len, num_points, point_dim)
             resampled = torch.cat([resampled, pad], dim=0)
 
         resampled = resampled[:max_strokes]
@@ -69,4 +69,6 @@ def pad_stroke_batch(batch: List[Dict], num_points: int, max_strokes: int) -> Di
         "stroke_lengths": lengths_tensor,
         "attn_mask": attn_mask,
         "max_points_per_stroke": max_points_per_stroke,
+        "key": [item["key"] for item in batch],
+        "font_name": [item["font_name"] for item in batch],
     }

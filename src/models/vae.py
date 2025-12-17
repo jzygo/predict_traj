@@ -90,6 +90,8 @@ class StrokeVAE(nn.Module):
     
     This is the RECOMMENDED approach - it uses learnable query tokens
     that attend to the latent via cross-attention.
+    
+    Supports point_dim = 2 (x, y) or 3 (x, y, r) for stroke representation.
     """
     
     def __init__(self, dims: DimConfig, cfg: VAEConfig) -> None:
@@ -98,12 +100,14 @@ class StrokeVAE(nn.Module):
         self.dims = dims
         model_dim = cfg.hidden_dim
         latent_dim = dims.latent_dim
+        point_dim = getattr(dims, 'point_dim', 3)  # 默认为 3 (x, y, r)
+        self.point_dim = point_dim
         num_heads = getattr(cfg, "num_heads", None) or _auto_num_heads(model_dim)
         ff_mult = getattr(cfg, "ff_mult", 4)
         ff_dim = int(model_dim * ff_mult)
 
-        # ========== Encoder (保持不变) ==========
-        self.point_embed = nn.Linear(2, model_dim)
+        # ========== Encoder (支持 point_dim 维输入) ==========
+        self.point_embed = nn.Linear(point_dim, model_dim)
         self.cls_token = nn.Parameter(torch.zeros(1, 1, model_dim))
         self.enc_pos_embed = nn.Parameter(torch.zeros(1, dims.num_points + 1, model_dim))
         self.enc_drop = nn.Dropout(cfg.dropout)
@@ -143,7 +147,7 @@ class StrokeVAE(nn.Module):
         ])
         
         self.dec_norm = nn.LayerNorm(model_dim)
-        self.out_proj = nn.Linear(model_dim, 2)
+        self.out_proj = nn.Linear(model_dim, point_dim)  # 输出 point_dim 维
 
         # 初始化
         nn.init.trunc_normal_(self.enc_pos_embed, std=0.02)
@@ -209,9 +213,12 @@ class StrokeVAE(nn.Module):
         # --- 基础 pointwise 重构误差（按点 L1） ---
         pointwise_l1 = F.l1_loss(recon, stroke, reduction='none').sum(dim=-1)  # [B, T]
 
-        # --- velocity / acc (二阶差分) ---
-        vel_recon = recon[:, 1:] - recon[:, :-1]        # [B, T-1, 2]
-        vel_target = stroke[:, 1:] - stroke[:, :-1]     # [B, T-1, 2]
+        # --- velocity / acc (二阶差分) - 只对 x, y 坐标计算 ---
+        xy_recon = recon[:, :, :2]  # 只取 x, y
+        xy_target = stroke[:, :, :2]
+        
+        vel_recon = xy_recon[:, 1:] - xy_recon[:, :-1]        # [B, T-1, 2]
+        vel_target = xy_target[:, 1:] - xy_target[:, :-1]     # [B, T-1, 2]
         vel_loss = F.smooth_l1_loss(vel_recon, vel_target)
 
         a_recon = vel_recon[:, 1:] - vel_recon[:, :-1]  # [B, T-2, 2]

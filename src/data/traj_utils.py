@@ -1,41 +1,55 @@
 import torch
 import numpy as np
 
-def resample_stroke(stroke, num_points=64):
+def resample_stroke(stroke, num_points=64, point_dim=3):
     """
     Resamples a single stroke to a fixed number of points.
     Args:
-        stroke: np.array or torch.Tensor of shape [N, 2]
+        stroke: np.array or torch.Tensor of shape [N, D] where D is 2 (x, y) or 3 (x, y, r)
         num_points: int
+        point_dim: int, dimension of each point (2 or 3)
     Returns:
-        torch.Tensor of shape [num_points * 2]
+        torch.Tensor of shape [num_points, point_dim]
     """
     if isinstance(stroke, torch.Tensor):
         stroke = stroke.cpu().numpy()
     else:
         stroke = np.array(stroke)
-        
+    
+    actual_dim = stroke.shape[1] if len(stroke.shape) > 1 and stroke.shape[0] > 0 else point_dim
+
+    # if len(stroke) > num_points:
+    #     print("Warning: stroke has more points than num_points, downsampling may lose data.")
+    #     print(f"Stroke length: {len(stroke)}, num_points: {num_points}")
+    
     if len(stroke) == 0:
-        return torch.zeros(num_points * 2, dtype=torch.float32)
+        return torch.zeros(num_points, point_dim, dtype=torch.float32)
         
     if len(stroke) == 1:
         new_traj = np.tile(stroke, (num_points, 1))
     else:
-        # Calculate cumulative distance
-        dists = np.linalg.norm(np.diff(stroke, axis=0), axis=1)
+        # Calculate cumulative distance based on (x, y) only
+        xy_coords = stroke[:, :2]
+        dists = np.linalg.norm(np.diff(xy_coords, axis=0), axis=1)
         cum_dists = np.insert(np.cumsum(dists), 0, 0.0)
         total_dist = cum_dists[-1]
         
         if total_dist < 1e-6:
-             new_traj = np.tile(stroke[0], (num_points, 1))
+            new_traj = np.tile(stroke[0], (num_points, 1))
         else:
             # Resample based on arc length
             new_dists = np.linspace(0, total_dist, num_points)
-            new_traj = np.zeros((num_points, 2), dtype=float)
-            new_traj[:, 0] = np.interp(new_dists, cum_dists, stroke[:, 0])
-            new_traj[:, 1] = np.interp(new_dists, cum_dists, stroke[:, 1])
-            
-    return torch.tensor(new_traj.flatten(), dtype=torch.float32)
+            new_traj = np.zeros((num_points, actual_dim), dtype=float)
+            for d in range(actual_dim):
+                new_traj[:, d] = np.interp(new_dists, cum_dists, stroke[:, d])
+    
+    # Ensure output has correct dimension
+    if new_traj.shape[1] < point_dim:
+        # Pad with zeros if needed (e.g., old 2D data)
+        pad = np.zeros((num_points, point_dim - new_traj.shape[1]))
+        new_traj = np.hstack([new_traj, pad])
+    
+    return torch.tensor(new_traj, dtype=torch.float32).view(num_points, point_dim)
 
 def normalize_strokes(strokes, num_points=128):
     """

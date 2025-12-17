@@ -8,6 +8,7 @@ class DimConfig:
     model_dim: int = 512
     image_size: int = 256
     max_strokes: int = 32
+    point_dim: int = 3  # x, y, r (r: 最大纯黑圆半径)
 
 
 @dataclass
@@ -39,6 +40,7 @@ class TrainConfig:
     num_workers: int = 4
     stage: int = 1
     resume: str = ""
+    use_amp: bool = False  # 启用混合精度训练 (Automatic Mixed Precision)
 
 
 @dataclass

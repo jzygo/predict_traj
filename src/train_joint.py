@@ -11,6 +11,7 @@ import torch.nn as nn
 import matplotlib.pyplot as plt
 import numpy as np
 from torch.utils.data import DataLoader, DistributedSampler
+from torch.cuda.amp import autocast, GradScaler
 
 SRC_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "."))
 if SRC_ROOT not in sys.path:
@@ -23,8 +24,8 @@ from models.vae import StrokeVAE
 from models.dit import DiT
 
 
-def collate_with_params(batch, num_points: int, max_strokes: int):
-    return pad_stroke_batch(batch, num_points=num_points, max_strokes=max_strokes)
+def collate_with_params(batch, num_points: int, max_strokes: int, point_dim: int = 3):
+    return pad_stroke_batch(batch, num_points=num_points, max_strokes=max_strokes, point_dim=point_dim)
 
 
 def build_config_from_args(args: argparse.Namespace) -> PipelineConfig:
@@ -37,6 +38,7 @@ def build_config_from_args(args: argparse.Namespace) -> PipelineConfig:
     cfg.dims.model_dim = args.model_dim
     cfg.dims.image_size = args.image_size
     cfg.dims.max_strokes = args.max_strokes
+    cfg.dims.point_dim = args.point_dim  # 新增 point_dim 参数
 
     cfg.vae.hidden_dim = args.vae_hidden
     cfg.vae.dropout = args.dropout
@@ -56,6 +58,7 @@ def build_config_from_args(args: argparse.Namespace) -> PipelineConfig:
     cfg.train.num_workers = args.num_workers
     cfg.train.stage = args.stage
     cfg.train.resume = args.resume
+    cfg.train.use_amp = args.amp
 
     cfg.dist.ddp = args.ddp
     cfg.dist.min_free_ratio = args.min_free_ratio
@@ -90,7 +93,7 @@ def build_dataloader(
     if distributed:
         sampler = DistributedSampler(dataset, num_replicas=world_size, rank=rank, shuffle=split == "all")
 
-    collate_fn = partial(collate_with_params, num_points=cfg.dims.num_points, max_strokes=cfg.dims.max_strokes)
+    collate_fn = partial(collate_with_params, num_points=cfg.dims.num_points, max_strokes=cfg.dims.max_strokes, point_dim=cfg.dims.point_dim)
 
     return DataLoader(
         dataset,
@@ -158,6 +161,8 @@ def train_one_epoch(
     sampler: Optional[DistributedSampler],
     is_main: bool,
     cfg: PipelineConfig,
+    scaler: Optional[GradScaler] = None,
+    use_amp: bool = False,
 ) -> Dict[str, float]:
     vae.train()
     dit.train()
@@ -175,61 +180,71 @@ def train_one_epoch(
 
         B, S, P, _ = strokes.shape
         max_strokes = cfg.dims.max_strokes
-        optim.zero_grad()
+        optim.zero_grad(set_to_none=True)  # 使用 set_to_none=True 更高效
 
         # VAE per stroke
         valid_strokes = stack_valid(strokes, lengths)
         if valid_strokes.numel() == 0:
             continue
 
-        # Stage 1: train VAE with reconstruction/KL only.
-        # Stage 2: keep VAE fixed (teacher) and do NOT run it with grad.
-        if cfg.train.stage == 1:
-            recon, kl, recon_loss, _ = vae(valid_strokes)
+        # 使用 autocast 进行混合精度前向传播
+        with autocast(enabled=use_amp):
+            # Stage 1: train VAE with reconstruction/KL only.
+            # Stage 2: keep VAE fixed (teacher) and do NOT run it with grad.
+            if cfg.train.stage == 1:
+                recon, kl, recon_loss, _ = vae(valid_strokes)
+            else:
+                recon_loss = torch.tensor(0.0, device=device)
+                kl = torch.tensor(0.0, device=device)
+
+            # Teacher latents from VAE encoder (detached): DiT should match VAE.
+            # Keep detached so gradients never push VAE to chase DiT/Flow.
+            with torch.no_grad():
+                mu_valid, _ = unwrap_module(vae).encode(valid_strokes)
+            latent_targets_main = pack_valid_latents(mu_valid, lengths, max_strokes=max_strokes)
+
+            # DiT prediction (now returns 2 values: latent, eos_logits)
+            # Pass target_latents for teacher forcing
+            latent_pred, eos_logits = dit(images, latent_targets_main, attn_mask)
+            
+            # latent_pred is (B, max_strokes, D), aligned with latent_targets_main
+            # No need to drop first query or shift, as the model handles autoregressive shift internally
+
+            # Masked latent loss
+            mask = torch.arange(max_strokes, device=device)[None, :] < lengths[:, None]
+            latent_loss = ((latent_pred - latent_targets_main).pow(2).sum(-1) * mask.float()).sum() / mask.float().clamp(min=1).sum()
+
+            # EOS loss
+            # eos_logits is (B, max_strokes)
+            # eos_target is (B, max_strokes + 1) -> slice to max_strokes
+            eos_target = eos_labels(lengths, max_strokes)[:, :max_strokes]
+            eos_loss = nn.functional.binary_cross_entropy_with_logits(eos_logits, eos_target, reduction="none")
+            eos_loss = eos_loss.mean()
+            # Loss weights (keep simple & explicit)
+            target_kl_w = 1e-4  # 建议由 0.1 降低到 1e-4 或 1e-3
+            warmup_epochs = 5
+            if epoch < warmup_epochs:
+                kl_w = target_kl_w * (epoch / warmup_epochs)
+            else:
+                kl_w = target_kl_w
+
+            if cfg.train.stage == 1:
+                total = recon_loss + kl_w * kl + latent_loss + eos_loss
+            else:
+                # Stage 2: Only train DiT (VAE fixed as teacher) + continuity regularization
+                total = eos_loss + latent_loss
+
+        # 混合精度反向传播
+        if use_amp and scaler is not None:
+            scaler.scale(total).backward()
+            scaler.unscale_(optim)
+            nn.utils.clip_grad_norm_(list(vae.parameters()) + list(dit.parameters()), 1.0)
+            scaler.step(optim)
+            scaler.update()
         else:
-            recon_loss = torch.tensor(0.0, device=device)
-            kl = torch.tensor(0.0, device=device)
-
-        # Teacher latents from VAE encoder (detached): DiT should match VAE.
-        # Keep detached so gradients never push VAE to chase DiT/Flow.
-        with torch.no_grad():
-            mu_valid, _ = unwrap_module(vae).encode(valid_strokes)
-        latent_targets_main = pack_valid_latents(mu_valid, lengths, max_strokes=max_strokes)
-
-        # DiT prediction (now returns 2 values: latent, eos_logits)
-        # Pass target_latents for teacher forcing
-        latent_pred, eos_logits = dit(images, latent_targets_main, attn_mask)
-        
-        # latent_pred is (B, max_strokes, D), aligned with latent_targets_main
-        # No need to drop first query or shift, as the model handles autoregressive shift internally
-
-        # Masked latent loss
-        mask = torch.arange(max_strokes, device=device)[None, :] < lengths[:, None]
-        latent_loss = ((latent_pred - latent_targets_main).pow(2).sum(-1) * mask.float()).sum() / mask.float().clamp(min=1).sum()
-
-        # EOS loss
-        # eos_logits is (B, max_strokes)
-        # eos_target is (B, max_strokes + 1) -> slice to max_strokes
-        eos_target = eos_labels(lengths, max_strokes)[:, :max_strokes]
-        eos_loss = nn.functional.binary_cross_entropy_with_logits(eos_logits, eos_target, reduction="none")
-        eos_loss = eos_loss.mean()
-        # Loss weights (keep simple & explicit)
-        target_kl_w = 1e-4  # 建议由 0.1 降低到 1e-4 或 1e-3
-        warmup_epochs = 5
-        if epoch < warmup_epochs:
-            kl_w = target_kl_w * (epoch / warmup_epochs)
-        else:
-            kl_w = target_kl_w
-
-        if cfg.train.stage == 1:
-            total = recon_loss + kl_w * kl + latent_loss + eos_loss
-        else:
-            # Stage 2: Only train DiT (VAE fixed as teacher) + continuity regularization
-            total = eos_loss + latent_loss
-
-        total.backward()
-        nn.utils.clip_grad_norm_(list(vae.parameters()) + list(dit.parameters()), 1.0)
-        optim.step()
+            total.backward()
+            nn.utils.clip_grad_norm_(list(vae.parameters()) + list(dit.parameters()), 1.0)
+            optim.step()
 
         logs["loss"] += total.item()
         logs["vae"] += recon_loss.item()
@@ -252,7 +267,8 @@ def save_epoch_visualization(
     device: torch.device,
     epoch: int,
     save_dir: str,
-    cfg: PipelineConfig
+    cfg: PipelineConfig,
+    use_amp: bool = False,
 ) -> None:
     vae.eval()
     dit.eval()
@@ -280,15 +296,15 @@ def save_epoch_visualization(
     
     # VAE encode-decode reconstruction
     if length > 0:
-        with torch.no_grad():
+        with torch.no_grad(), autocast(enabled=use_amp):
             # VAE encode to latent and decode back
             mus = vae.infer(valid_strokes)
-            vae_recon = unwrap_module(vae).decode(mus).cpu().numpy()
+            vae_recon = unwrap_module(vae).decode(mus).cpu().float().numpy()
     else:
-        vae_recon = np.zeros((0, cfg.dims.num_points, 2))
+        vae_recon = np.zeros((0, cfg.dims.num_points, cfg.dims.point_dim))
 
     # DiT + Flow predictions
-    with torch.no_grad():
+    with torch.no_grad(), autocast(enabled=use_amp):
         latent_pred, eos_probs, num_strokes = dit.infer(image.unsqueeze(0))
         latent_pred = latent_pred[0]  # [num_strokes, latent_dim]
         eos_probs = eos_probs[0]    # [num_strokes]
@@ -302,9 +318,9 @@ def save_epoch_visualization(
         stroke_latents = latent_pred[:pred_length]
         
         if stroke_latents.size(0) > 0:
-            dit_strokes = unwrap_module(vae).decode(stroke_latents).cpu().numpy()
+            dit_strokes = unwrap_module(vae).decode(stroke_latents).cpu().float().numpy()
         else:
-            dit_strokes = np.zeros((0, cfg.dims.num_points, 2))
+            dit_strokes = np.zeros((0, cfg.dims.num_points, cfg.dims.point_dim))
 
     # Create figure with 4 subplots
     fig, axes = plt.subplots(1, 4, figsize=(20, 5))
@@ -314,15 +330,16 @@ def save_epoch_visualization(
     axes[0].set_title(f"Input Image, {font_name}, {key}", fontsize=12, fontweight='bold')
     axes[0].axis("off")
     
-    def plot_strokes(ax, strokes_data, title, background_img=None):
+    def plot_strokes(ax, strokes_data, title, background_img=None, show_radius=False):
         """
         绘制笔画轨迹，可选添加背景图像
         
         Args:
             ax: matplotlib axis
-            strokes_data: 笔画数据
+            strokes_data: 笔画数据，支持 (N, P, 2) 或 (N, P, 3)
             title: 子图标题
             background_img: 背景图像 (可选)
+            show_radius: 是否显示半径圆圈
         """
         # 如果提供了背景图像，先显示它
         if background_img is not None:
@@ -341,22 +358,36 @@ def save_epoch_visualization(
         if len(strokes_data) > 0:
             colors = plt.cm.jet(np.linspace(0, 1, len(strokes_data)))
             for i, s in enumerate(strokes_data):
+                # 只取 x, y 坐标绘制
+                x, y = s[:, 0], s[:, 1]
                 # 加粗线条
-                ax.plot(s[:, 0], -s[:, 1], color=colors[i], linewidth=3, alpha=0.9)
+                ax.plot(x, -y, color=colors[i], linewidth=3, alpha=0.9)
                 # 标记起点
-                ax.scatter(s[0, 0], -s[0, 1], color=colors[i], s=50, 
+                ax.scatter(x[0], -y[0], color=colors[i], s=50, 
                           marker='o', edgecolors='white', linewidths=2, zorder=5)
                 # 标记轨迹点
-                ax.scatter(s[:, 0], -s[:, 1], color=colors[i], s=5, zorder=4)
+                ax.scatter(x, -y, color=colors[i], s=5, zorder=4)
+                
+                # 如果有 r 维度且需要显示，画半径圆
+                if show_radius and s.shape[1] >= 3:
+                    max_r_pixel = 20  # max_radius 默认为 20
+                    max_r_normalized = max_r_pixel / (cfg.dims.image_size / 2)
+                    for j in range(0, len(s), 2):
+                        # r 从 [-1, 1] 反归一化
+                        r_val = (s[j, 2] + 1) / 2 * max_r_normalized
+                        if r_val > 0.01:
+                            circle = plt.Circle((x[j], -y[j]), r_val, 
+                                              fill=False, color=colors[i], alpha=0.4, linewidth=1)
+                            ax.add_patch(circle)
     
-    # 2. Ground Truth (带背景)
-    plot_strokes(axes[1], gt_strokes, "Ground Truth", background_img=img_np)
+    # 2. Ground Truth (带背景，显示半径)
+    plot_strokes(axes[1], gt_strokes, "Ground Truth", background_img=img_np, show_radius=True)
     
     # 3. VAE Reconstruction (带背景)
-    plot_strokes(axes[2], vae_recon, "VAE Recon\n(encode→decode)", background_img=img_np)
+    plot_strokes(axes[2], vae_recon, "VAE Recon\n(encode→decode)", background_img=img_np, show_radius=True)
 
     # 4. DiT + VAE Decoder (带背景)
-    plot_strokes(axes[3], dit_strokes, "DiT + VAE Decoder", background_img=img_np)
+    plot_strokes(axes[3], dit_strokes, "DiT + VAE Decoder", background_img=img_np, show_radius=True)
     
     os.makedirs(save_dir, exist_ok=True)
     plt.tight_layout()
@@ -433,6 +464,12 @@ def run_worker(rank: int, world_size: int, cfg: PipelineConfig) -> None:
     )
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optim, T_max=cfg.train.epochs)
 
+    # 混合精度训练：创建 GradScaler
+    use_amp = cfg.train.use_amp and torch.cuda.is_available()
+    scaler = GradScaler(enabled=use_amp)
+    if rank == 0 and use_amp:
+        print("Mixed precision training (AMP) enabled.")
+
     train_loader = build_dataloader(
         cfg,
         split="all",
@@ -443,7 +480,11 @@ def run_worker(rank: int, world_size: int, cfg: PipelineConfig) -> None:
 
     history = []
     for epoch in range(cfg.train.epochs):
-        logs = train_one_epoch(vae, dit, optim, train_loader, device, epoch, train_loader.sampler, rank == 0, cfg=cfg)
+        logs = train_one_epoch(
+            vae, dit, optim, train_loader, device, epoch, 
+            train_loader.sampler, rank == 0, cfg=cfg,
+            scaler=scaler, use_amp=use_amp
+        )
         scheduler.step()
         if rank == 0:
             history.append(logs)
@@ -451,7 +492,10 @@ def run_worker(rank: int, world_size: int, cfg: PipelineConfig) -> None:
                 f"Epoch {epoch}: loss={logs['loss']:.4f} vae={logs['vae']:.4f} latent={logs['latent']:.4f} eos={logs['eos']:.4f}"
             )
             save_checkpoint(vae, dit, optim, epoch, cfg.save_dir)
-            save_epoch_visualization(unwrap_module(vae), unwrap_module(dit), train_loader, device, epoch, cfg.save_dir, cfg)
+            save_epoch_visualization(
+                unwrap_module(vae), unwrap_module(dit), train_loader, 
+                device, epoch, cfg.save_dir, cfg, use_amp=use_amp
+            )
     # if rank == 0 and cfg.vis_out:
     #     save_vis(history, cfg.vis_out)
 
@@ -463,28 +507,30 @@ def main() -> None:
     parser.add_argument("--data_root", type=str, default="/data1/jizy/font_out")
     parser.add_argument("--batch_size", type=int, default=64)
     parser.add_argument("--epochs", type=int, default=50)
-    parser.add_argument("--lr", type=float, default=5e-5)
-    parser.add_argument("--weight_decay", type=float, default=1e-4)
-    parser.add_argument("--num_workers", type=int, default=1)
+    parser.add_argument("--lr", type=float, default=1e-4)
+    parser.add_argument("--weight_decay", type=float, default=5e-5)
+    parser.add_argument("--num_workers", type=int, default=4)
     parser.add_argument("--device", type=str, default="cuda")
 
     parser.add_argument("--num_points", type=int, default=24)
-    parser.add_argument("--latent_dim", type=int, default=48)
-    parser.add_argument("--model_dim", type=int, default=768)
+    parser.add_argument("--latent_dim", type=int, default=72)
+    parser.add_argument("--model_dim", type=int, default=1024)
     parser.add_argument("--image_size", type=int, default=256)
     parser.add_argument("--max_strokes", type=int, default=32)
+    parser.add_argument("--point_dim", type=int, default=3, help="Point dimension: 2 (x,y) or 3 (x,y,r)")
 
     parser.add_argument("--vae_hidden", type=int, default=768)
-    parser.add_argument("--vae_layers", type=int, default=8)
+    parser.add_argument("--vae_layers", type=int, default=12)
     parser.add_argument("--patch_size", type=int, default=8)
     parser.add_argument("--dit_depth", type=int, default=16)
-    parser.add_argument("--dit_heads", type=int, default=12)
+    parser.add_argument("--dit_heads", type=int, default=16)
     parser.add_argument("--use_pretrained_cnn", action="store_true")
     parser.add_argument("--dropout", type=float, default=0.1)
 
     parser.add_argument("--stage", type=int, default=1, help="Training stage: 1 or 2")
     # parser.add_argument("--resume", type=str, default="", help="Path to checkpoint to resume from")
     parser.add_argument("--resume", type=str, default="/data1/jizy/checkpoints/ckp.pt", help="Path to checkpoint to resume from")
+    parser.add_argument("--amp", action="store_true", help="Enable automatic mixed precision training")
 
     parser.add_argument("--ddp", action="store_true", help="Enable DDP and auto-pick free GPUs")
     parser.add_argument("--min_free_ratio", type=float, default=0.7, help="Minimum free memory ratio to select GPU")

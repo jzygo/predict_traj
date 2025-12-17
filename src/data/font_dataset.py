@@ -9,6 +9,46 @@ from PIL import Image
 import matplotlib.pyplot as plt
 import numpy as np
 import torchvision.transforms as transforms
+from scipy import ndimage
+
+
+def compute_max_black_radius(binary_img: np.ndarray, points: np.ndarray, max_radius: int = 20) -> np.ndarray:
+    """
+    计算每个轨迹点处仅包含黑色像素的最大圆半径。
+    
+    Args:
+        binary_img: 二值化图像，黑色像素为 True，白色为 False，shape (H, W)
+        points: 轨迹点坐标，shape (N, 2)，以像素为单位 (x, y)
+        max_radius: 半径上限
+        
+    Returns:
+        radii: 每个点对应的最大半径，shape (N,)
+    """
+    H, W = binary_img.shape
+    N = len(points)
+    radii = np.zeros(N, dtype=np.float32)
+    
+    # 计算距离变换：每个黑色像素到最近白色像素的距离
+    # 首先反转：白色区域为 True，黑色区域为 False
+    white_mask = ~binary_img
+    # distance_transform_edt 计算每个 False 位置到最近 True 位置的距离
+    # 我们需要黑色像素到白色像素的距离，所以用 white_mask
+    dist_to_white = ndimage.distance_transform_edt(~white_mask)
+    
+    for i, (x, y) in enumerate(points):
+        # 将坐标四舍五入到最近的整数像素
+        px, py = int(round(x)), int(round(y))
+        
+        # 边界检查
+        if px < 0 or px >= W or py < 0 or py >= H:
+            radii[i] = 0.0
+            continue
+        
+        # 获取该点到最近白色像素的距离
+        r = dist_to_white[py, px]
+        radii[i] = min(r, max_radius)
+    
+    return radii
 
 class FontDataset(Dataset):
     """
@@ -16,7 +56,7 @@ class FontDataset(Dataset):
     包含图像数据 (JPG bytes) 和 笔画数据 (归一化坐标)。
     支持多字体加载及训练集/验证集划分。
     """
-    def __init__(self, data_root, font_names=None, split='all', val_ratio=0.1, target_size=(256, 256), seed=42):
+    def __init__(self, data_root, font_names=None, split='all', val_ratio=0.1, target_size=(256, 256), seed=42, max_radius=20):
         """
         Args:
             data_root (str): 数据集根目录
@@ -26,9 +66,11 @@ class FontDataset(Dataset):
             transform (callable, optional): 应用于图像的 transform
             target_size (tuple): 图像调整大小的目标尺寸 (width, height)
             seed (int): 随机种子，用于确保划分的一致性。
+            max_radius (int): 计算 r 时的半径上限，默认 20 像素
         """
         self.data_root = data_root
         self.target_size = target_size
+        self.max_radius = max_radius
         
         # 确定要加载的字体列表
         if font_names is None:
@@ -126,31 +168,59 @@ class FontDataset(Dataset):
             transforms.Resize(self.target_size),
             transforms.ToTensor(), # 归一化到 [0, 1]
         ])
-        image = default_transform(image)
+        image_tensor = default_transform(image)
         
-        # 处理笔画
-        strokes_tensors = [torch.tensor(s, dtype=torch.float32) for s in strokes]
+        # 将图像 resize 后用于计算 r
+        resized_image = image.resize(self.target_size, Image.Resampling.LANCZOS)
+        resized_np = np.array(resized_image)
         
-        for i in range(len(strokes_tensors)):
-            strokes_tensors[i] = strokes_tensors[i] / max_dim * 2.0 - 1.0
+        # 二值化：将 RGB 转灰度，然后阈值分割
+        # 灰度 < 128 为黑色 (True)，否则为白色 (False)
+        gray = np.mean(resized_np, axis=2)
+        binary_img = gray < 128  # 黑色像素为 True
+        
+        # 计算从原始坐标到 target_size 的缩放比例
+        scale = self.target_size[0] / max_dim  # 假设 target_size 是正方形
+        
+        # 处理笔画并计算 r
+        strokes_tensors = []
+        for s in strokes:
+            stroke_np = np.array(s, dtype=np.float32)
+            
+            # 将原始像素坐标映射到 target_size
+            scaled_coords = stroke_np * scale  # 映射到 target_size 像素坐标
+            
+            # 计算每个点的最大黑色圆半径
+            radii = compute_max_black_radius(binary_img, scaled_coords, self.max_radius)
+            
+            # 将坐标归一化到 [-1, 1]
+            normalized_coords = stroke_np / max_dim * 2.0 - 1.0
+            
+            # 将半径归一化到 [-1, 1]，r 上限为 max_radius
+            normalized_radii = radii / self.max_radius * 2.0 - 1.0
+            
+            # 合并为 (N, 3) 的张量：(x, y, r)
+            stroke_with_r = np.column_stack([normalized_coords, normalized_radii])
+            strokes_tensors.append(torch.tensor(stroke_with_r, dtype=torch.float32))
 
         return {
             'key': key,
             'font_name': font_name,
-            'image': image,
+            'image': image_tensor,
             'strokes': strokes_tensors
         }
 
 def visualize_sample(dataset, idx=None):
     """
     可视化数据集中的一个样本：将图像和对应的笔画轨迹叠加显示。
+    支持显示 r 维度（用圆圈半径表示）。
     """
     if idx is None:
         idx = random.randint(0, len(dataset) - 1)
     for i in range(len(dataset)):
         sample = dataset[i]
         if sample['key'] == 'GB45':
-            print("Successfully found sample with key 'GB903'")
+            print("Successfully found sample with key 'GB45'")
             break
     key = sample['key']
     font_name = sample.get('font_name', 'Unknown')
@@ -189,6 +259,9 @@ def visualize_sample(dataset, idx=None):
         if len(stroke) == 0:
             continue
         
+        # 检查是否有 r 维度
+        has_r = stroke.shape[1] >= 3
+        
         # 绘制笔画路径，加粗线条
         plt.plot(stroke[:, 0], -stroke[:, 1], 
                 label=f'Stroke {i+1}', 
@@ -203,6 +276,17 @@ def visualize_sample(dataset, idx=None):
         # 标出过程点
         plt.scatter(stroke[:, 0], -stroke[:, 1], 
                    color=colors[i], s=5, zorder=4)
+        
+        # 如果有 r 维度，用圆圈表示半径
+        if has_r:
+            max_radius_normalized = dataset.max_radius / (dataset.target_size[0] / 2)  # 转换为 [-1, 1] 坐标系
+            for j in range(0, len(stroke), max(1, len(stroke) // 5)):  # 每隔几个点画一个圆
+                # r 从 [-1, 1] 反归一化到像素值，再转换到 [-1, 1] 坐标系
+                r_normalized = (stroke[j, 2] + 1) / 2 * max_radius_normalized
+                if r_normalized > 0.01:  # 只画有意义的半径
+                    circle = plt.Circle((stroke[j, 0], -stroke[j, 1]), r_normalized, 
+                                        fill=False, color=colors[i], alpha=0.5, linewidth=1)
+                    plt.gca().add_patch(circle)
 
     plt.title(f"Overlayed: {key} ({font_name})", fontsize=14, fontweight='bold')
     plt.xlim(-1.2, 1.2)
