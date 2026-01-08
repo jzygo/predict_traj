@@ -4,20 +4,7 @@
     <option name="autoReloadType" value="SELECTIVE" />
   </component>
   <component name="ChangeListManager">
-    <list default="true" id="983d1f42-2c94-4bb0-b5f1-83b179f29dfc" name="更改" comment="">
-      <change afterPath="$PROJECT_DIR$/utils/extract_pt.py" afterDir="false" />
-      <change afterPath="$PROJECT_DIR$/utils/render_usd_to_video.py" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/.gitignore" beforeDir="false" afterPath="$PROJECT_DIR$/.gitignore" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/.idea/misc.xml" beforeDir="false" afterPath="$PROJECT_DIR$/.idea/misc.xml" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/.idea/predict_traj.iml" beforeDir="false" afterPath="$PROJECT_DIR$/.idea/predict_traj.iml" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/.idea/vcs.xml" beforeDir="false" afterPath="$PROJECT_DIR$/.idea/vcs.xml" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/.idea/workspace.xml" beforeDir="false" afterPath="$PROJECT_DIR$/.idea/workspace.xml" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/src/config.py" beforeDir="false" afterPath="$PROJECT_DIR$/src/config.py" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/src/data/collate_utils.py" beforeDir="false" afterPath="$PROJECT_DIR$/src/data/collate_utils.py" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/src/data/font_dataset.py" beforeDir="false" afterPath="$PROJECT_DIR$/src/data/font_dataset.py" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/src/data/traj_utils.py" beforeDir="false" afterPath="$PROJECT_DIR$/src/data/traj_utils.py" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/src/infer.py" beforeDir="false" afterPath="$PROJECT_DIR$/src/infer.py" afterDir="false" />
-    </list>
+    <list default="true" id="983d1f42-2c94-4bb0-b5f1-83b179f29dfc" name="更改" comment="" />
     <option name="SHOW_DIALOG" value="false" />
     <option name="HIGHLIGHT_CONFLICTS" value="true" />
     <option name="HIGHLIGHT_NON_ACTIVE_CHANGELIST" value="false" />
@@ -54,24 +41,24 @@
     <option name="hideEmptyMiddlePackages" value="true" />
     <option name="showLibraryContents" value="true" />
   </component>
-  <component name="PropertiesComponent">{
-  &quot;keyToString&quot;: {
-    &quot;Python.acc_video.executor&quot;: &quot;Run&quot;,
-    &quot;Python.check_pt.executor&quot;: &quot;Debug&quot;,
-    &quot;Python.example_ik_brush_trajectory.executor&quot;: &quot;Run&quot;,
-    &quot;Python.extract_pt.executor&quot;: &quot;Run&quot;,
-    &quot;Python.xpbd_warp_diff.executor&quot;: &quot;Run&quot;,
-    &quot;RunOnceActivity.ShowReadmeOnStart&quot;: &quot;true&quot;,
-    &quot;git-widget-placeholder&quot;: &quot;9c6bad17&quot;,
-    &quot;last_opened_file_path&quot;: &quot;E:/Study/Wangxuan/CalliMaster/project/predict_traj/utils&quot;,
-    &quot;node.js.detected.package.eslint&quot;: &quot;true&quot;,
-    &quot;node.js.detected.package.tslint&quot;: &quot;true&quot;,
-    &quot;node.js.selected.package.eslint&quot;: &quot;(autodetect)&quot;,
-    &quot;node.js.selected.package.tslint&quot;: &quot;(autodetect)&quot;,
-    &quot;nodejs_package_manager_path&quot;: &quot;npm&quot;,
-    &quot;vue.rearranger.settings.migration&quot;: &quot;true&quot;
+  <component name="PropertiesComponent"><![CDATA[{
+  "keyToString": {
+    "Python.acc_video.executor": "Run",
+    "Python.check_pt.executor": "Debug",
+    "Python.example_ik_brush_trajectory.executor": "Run",
+    "Python.extract_pt.executor": "Run",
+    "Python.xpbd_warp_diff.executor": "Run",
+    "RunOnceActivity.ShowReadmeOnStart": "true",
+    "git-widget-placeholder": "new",
+    "last_opened_file_path": "E:/Study/Wangxuan/CalliMaster/project/predict_traj/utils",
+    "node.js.detected.package.eslint": "true",
+    "node.js.detected.package.tslint": "true",
+    "node.js.selected.package.eslint": "(autodetect)",
+    "node.js.selected.package.tslint": "(autodetect)",
+    "nodejs_package_manager_path": "npm",
+    "vue.rearranger.settings.migration": "true"
   }
-}</component>
+}]]></component>
   <component name="RecentsManager">
     <key name="CopyFile.RECENT_KEYS">
       <recent name="E:\Study\Wangxuan\CalliMaster\project\predict_traj\utils" />
@@ -152,7 +139,7 @@
       <workItem from="1767075027548" duration="19075000" />
       <workItem from="1767531069663" duration="1804000" />
       <workItem from="1767689572342" duration="33359000" />
-      <workItem from="1767862583180" duration="361000" />
+      <workItem from="1767862583180" duration="1322000" />
     </task>
     <servers />
   </component>
