@@ -10,27 +10,35 @@ def center(stroke: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
     return stroke - center_pt, center_pt
 
 
-def resample_and_stack(strokes: List[torch.Tensor], num_points: int, point_dim: int = 3) -> Tuple[torch.Tensor, torch.Tensor]:
-    merged_strokes = []
+def resample_and_stack(strokes: List[torch.Tensor], num_points: int, point_dim: int = 3) -> Tuple[torch.Tensor, int]:
+    """
+    将笔画列表堆叠成张量。
+    
+    注意：如果笔画已在 FontDataset 中预先重采样到 num_points，则直接堆叠；
+    否则仍执行 resample_stroke 进行重采样。
+    
+    Args:
+        strokes: 笔画张量列表，每个形状可能是 (N_i, point_dim) 或已经是 (num_points, point_dim)
+        num_points: 每个笔画的目标点数
+        point_dim: 每个点的维度 (2 或 3)
+    
+    Returns:
+        stacked: 堆叠后的张量，形状 (num_strokes, num_points, point_dim)
+        max_points_per_stroke: 原始笔画中的最大点数（用于参考）
+    """
     max_points_per_stroke = 0
-    for i, s in enumerate(strokes):
-        # if i > 0:
-        #     prev_end = strokes[i - 1][-1].clone()
-        #     now_start = s[0].clone()
-        #     offset = prev_end - now_start
-        #     if offset.abs().sum() < 1e-2:
-        #         merged_strokes[-1] = torch.cat([merged_strokes[-1], s], dim=0)
-        #         # print(f"Merging stroke {i} with previous stroke due to small offset {offset.abs().sum()}")
-        #     else:
-        #         merged_strokes.append(s)
-        # else:
-            merged_strokes.append(s)
     resampled = []
-    for s in merged_strokes:
+    for s in strokes:
         max_points_per_stroke = max(max_points_per_stroke, len(s))
-        resampled.append(resample_stroke(s, num_points=num_points, point_dim=point_dim))
+        # 检查笔画是否已经是目标形状
+        if len(s) == num_points and s.shape[-1] == point_dim:
+            # 已经重采样过，直接使用
+            resampled.append(s if isinstance(s, torch.Tensor) else torch.tensor(s, dtype=torch.float32))
+        else:
+            # 需要重采样（兼容旧数据或未预处理的情况）
+            resampled.append(resample_stroke(s, num_points=num_points, point_dim=point_dim))
     if len(resampled) == 0:
-        return torch.zeros(0, num_points, point_dim), torch.zeros(0, point_dim)
+        return torch.zeros(0, num_points, point_dim), 0
     stacked = torch.stack(resampled, dim=0)
     return stacked, max_points_per_stroke
 

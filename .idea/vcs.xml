@@ -3,5 +3,30 @@
   <component name="VcsDirectoryMappings">
     <mapping directory="" vcs="Git" />
     <mapping directory="$PROJECT_DIR$/Cosmos-Tokenizer" vcs="Git" />
+    <mapping directory="$PROJECT_DIR$/third_party/imgui_bundle" vcs="Git" />
+    <mapping directory="$PROJECT_DIR$/third_party/imgui_bundle/_example_integration" vcs="Git" />
+    <mapping directory="$PROJECT_DIR$/third_party/imgui_bundle/external/ImCoolBar/ImCoolBar" vcs="Git" />
+    <mapping directory="$PROJECT_DIR$/third_party/imgui_bundle/external/ImFileDialog/ImFileDialog" vcs="Git" />
+    <mapping directory="$PROJECT_DIR$/third_party/imgui_bundle/external/ImGuiColorTextEdit/ImGuiColorTextEdit" vcs="Git" />
+    <mapping directory="$PROJECT_DIR$/third_party/imgui_bundle/external/ImGuizmo/ImGuizmo" vcs="Git" />
+    <mapping directory="$PROJECT_DIR$/third_party/imgui_bundle/external/glfw/glfw" vcs="Git" />
+    <mapping directory="$PROJECT_DIR$/third_party/imgui_bundle/external/hello_imgui/hello_imgui" vcs="Git" />
+    <mapping directory="$PROJECT_DIR$/third_party/imgui_bundle/external/imgui-command-palette/imgui-command-palette" vcs="Git" />
+    <mapping directory="$PROJECT_DIR$/third_party/imgui_bundle/external/imgui-knobs/imgui-knobs" vcs="Git" />
+    <mapping directory="$PROJECT_DIR$/third_party/imgui_bundle/external/imgui-node-editor/imgui-node-editor" vcs="Git" />
+    <mapping directory="$PROJECT_DIR$/third_party/imgui_bundle/external/imgui/imgui" vcs="Git" />
+    <mapping directory="$PROJECT_DIR$/third_party/imgui_bundle/external/imgui_md/imgui_md" vcs="Git" />
+    <mapping directory="$PROJECT_DIR$/third_party/imgui_bundle/external/imgui_md/md4c" vcs="Git" />
+    <mapping directory="$PROJECT_DIR$/third_party/imgui_bundle/external/imgui_test_engine/imgui_test_engine" vcs="Git" />
+    <mapping directory="$PROJECT_DIR$/third_party/imgui_bundle/external/imgui_tex_inspect/imgui_tex_inspect" vcs="Git" />
+    <mapping directory="$PROJECT_DIR$/third_party/imgui_bundle/external/imgui_toggle/imgui_toggle" vcs="Git" />
+    <mapping directory="$PROJECT_DIR$/third_party/imgui_bundle/external/immvision/cvnp" vcs="Git" />
+    <mapping directory="$PROJECT_DIR$/third_party/imgui_bundle/external/immvision/cvnp_nano" vcs="Git" />
+    <mapping directory="$PROJECT_DIR$/third_party/imgui_bundle/external/immvision/immvision" vcs="Git" />
+    <mapping directory="$PROJECT_DIR$/third_party/imgui_bundle/external/implot/implot" vcs="Git" />
+    <mapping directory="$PROJECT_DIR$/third_party/imgui_bundle/external/implot3d/implot3d" vcs="Git" />
+    <mapping directory="$PROJECT_DIR$/third_party/imgui_bundle/external/nanovg/MetalNanoVG" vcs="Git" />
+    <mapping directory="$PROJECT_DIR$/third_party/imgui_bundle/external/nanovg/nanovg" vcs="Git" />
+    <mapping directory="$PROJECT_DIR$/third_party/newton" vcs="Git" />
   </component>
 </project>

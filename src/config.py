@@ -58,3 +58,9 @@ class PipelineConfig:
     dit: DiTConfig = field(default_factory=DiTConfig)
     train: TrainConfig = field(default_factory=TrainConfig)
     dist: DistConfig = field(default_factory=DistConfig)
+
+BRUSH_UP_POSITION = 0.5
+MAX_STEP_LENGTH = 0.06
+VELOCITY = 0.02
+MAX_GRAVITY = 9.81
+STEP_NUM_PER_POINTS = 30

@@ -184,3 +184,56 @@ def recover_strokes(action, num_points=128):
         strokes.append(np.array(current_stroke))
 
     return strokes
+
+
+def resample_stroke_by_dist(stroke, step_size=0.005, point_dim=3):
+    """
+    Resamples a single stroke such that consecutive points are approximately step_size apart.
+    Args:
+        stroke: np.array or torch.Tensor of shape [N, D] where D is 2 (x, y) or 3 (x, y, r)
+        step_size: float, the desired arc length distance between points
+        point_dim: int, dimension of each point (2 or 3)
+    Returns:
+        torch.Tensor of shape [M, point_dim] where M depends on the stroke length and step_size
+    """
+    if isinstance(stroke, torch.Tensor):
+        stroke = stroke.cpu().numpy()
+    else:
+        stroke = np.array(stroke)
+    
+    actual_dim = stroke.shape[1] if len(stroke.shape) > 1 and stroke.shape[0] > 0 else point_dim
+
+    if len(stroke) == 0:
+        return torch.zeros(0, point_dim, dtype=torch.float32)
+        
+    if len(stroke) == 1:
+        new_traj = stroke.reshape(1, actual_dim)
+        if new_traj.shape[1] < point_dim:
+            pad = np.zeros((1, point_dim - new_traj.shape[1]))
+            new_traj = np.hstack([new_traj, pad])
+        return torch.tensor(new_traj, dtype=torch.float32)
+    
+    # Calculate cumulative distance based on (x, y) only
+    xy_coords = stroke[:, :2]
+    dists = np.linalg.norm(np.diff(xy_coords, axis=0), axis=1)
+    cum_dists = np.insert(np.cumsum(dists), 0, 0.0)
+    total_dist = cum_dists[-1]
+    
+    if total_dist < 1e-6:
+        new_traj = stroke[0].reshape(1, actual_dim)
+    else:
+        # Determine number of points to result in segment length approx step_size
+        num_points = max(2, int(np.round(total_dist / step_size)) + 1)
+        
+        new_dists = np.linspace(0, total_dist, num_points)
+        new_traj = np.zeros((num_points, actual_dim), dtype=float)
+        for d in range(actual_dim):
+            new_traj[:, d] = np.interp(new_dists, cum_dists, stroke[:, d])
+            
+    # Ensure output has correct dimension
+    if new_traj.shape[1] < point_dim:
+        pad = np.zeros((new_traj.shape[0], point_dim - new_traj.shape[1]))
+        new_traj = np.hstack([new_traj, pad])
+    
+    return torch.tensor(new_traj, dtype=torch.float32)
+

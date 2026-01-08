@@ -56,7 +56,7 @@ class FontDataset(Dataset):
     包含图像数据 (JPG bytes) 和 笔画数据 (归一化坐标)。
     支持多字体加载及训练集/验证集划分。
     """
-    def __init__(self, data_root, font_names=None, split='all', val_ratio=0.1, target_size=(256, 256), seed=42, max_radius=20):
+    def __init__(self, data_root, font_names=None, split='all', val_ratio=0.1, target_size=(256, 256), seed=42, max_radius=20, num_points_per_stroke=64):
         """
         Args:
             data_root (str): 数据集根目录
@@ -67,10 +67,12 @@ class FontDataset(Dataset):
             target_size (tuple): 图像调整大小的目标尺寸 (width, height)
             seed (int): 随机种子，用于确保划分的一致性。
             max_radius (int): 计算 r 时的半径上限，默认 20 像素
+            num_points_per_stroke (int): 每个笔画重采样的点数，默认 64
         """
         self.data_root = data_root
         self.target_size = target_size
         self.max_radius = max_radius
+        self.num_points_per_stroke = num_points_per_stroke
         
         # 确定要加载的字体列表
         if font_names is None:
@@ -182,24 +184,36 @@ class FontDataset(Dataset):
         # 计算从原始坐标到 target_size 的缩放比例
         scale = self.target_size[0] / max_dim  # 假设 target_size 是正方形
         
-        # 处理笔画并计算 r
+        # 处理笔画：先重采样 (x, y)，再计算 r
         strokes_tensors = []
         for s in strokes:
             stroke_np = np.array(s, dtype=np.float32)
             
-            # 将原始像素坐标映射到 target_size
-            scaled_coords = stroke_np * scale  # 映射到 target_size 像素坐标
+            if len(stroke_np) == 0:
+                # 空笔画：返回全零张量
+                strokes_tensors.append(torch.zeros(self.num_points_per_stroke, 3, dtype=torch.float32))
+                continue
             
-            # 计算每个点的最大黑色圆半径
+            # 步骤1：先对 (x, y) 坐标进行重采样
+            # 使用 resample_stroke 函数，只处理 2D 坐标
+            from .traj_utils import resample_stroke
+            resampled_xy = resample_stroke(stroke_np[:, :2], num_points=self.num_points_per_stroke, point_dim=2)
+            resampled_xy = resampled_xy.numpy()  # shape: (num_points_per_stroke, 2)
+            
+            # 步骤2：将重采样后的归一化坐标 (原始像素坐标 / max_dim) 转换为 target_size 像素坐标
+            # resampled_xy 是原始像素坐标，需要映射到 target_size
+            scaled_coords = resampled_xy * scale  # 映射到 target_size 像素坐标
+            
+            # 步骤3：根据重采样后的坐标计算每个点的最大黑色圆半径
             radii = compute_max_black_radius(binary_img, scaled_coords, self.max_radius)
             
-            # 将坐标归一化到 [-1, 1]
-            normalized_coords = stroke_np / max_dim * 2.0 - 1.0
+            # 步骤4：将坐标归一化到 [-1, 1]
+            normalized_coords = resampled_xy / max_dim * 2.0 - 1.0
             
-            # 将半径归一化到 [-1, 1]，r 上限为 max_radius
+            # 步骤5：将半径归一化到 [-1, 1]，r 上限为 max_radius
             normalized_radii = radii / self.max_radius * 2.0 - 1.0
             
-            # 合并为 (N, 3) 的张量：(x, y, r)
+            # 合并为 (num_points_per_stroke, 3) 的张量：(x, y, r)
             stroke_with_r = np.column_stack([normalized_coords, normalized_radii])
             strokes_tensors.append(torch.tensor(stroke_with_r, dtype=torch.float32))
 
