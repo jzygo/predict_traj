@@ -1029,7 +1029,7 @@ class XPBDSimulator:
         else:
             self.use_rotation = False
 
-    def load_brush(self, brush: Brush):
+    def load_brush(self, brush: Brush, keep_ink_canvas: bool = False):
         """Load particles and constraints from brush"""
         # Generate brush structure if not done
         if not brush.hairs:
@@ -1068,9 +1068,10 @@ class XPBDSimulator:
         self._delta_z = wp.zeros((self.batch_size, self.num_particles), dtype=wp.float64, device=self.device)
 
         # Initialize ink canvas (1x1 canvas mapped to canvas_resolution x canvas_resolution pixels)
-        canvas_size = self.canvas_resolution * self.canvas_resolution
-        # Enable gradient tracking on the ink canvas for autodiff
-        self.ink_canvas = wp.zeros((self.batch_size, canvas_size), dtype=wp.float64, device=self.device, requires_grad=True)
+        if not keep_ink_canvas or self.ink_canvas is None:
+            canvas_size = self.canvas_resolution * self.canvas_resolution
+            # Enable gradient tracking on the ink canvas for autodiff
+            self.ink_canvas = wp.zeros((self.batch_size, canvas_size), dtype=wp.float64, device=self.device, requires_grad=True)
 
         # Extract constraints (会设置 fixed_local_coords)
         self._extract_constraints(brush.constraints, brush.root_position)

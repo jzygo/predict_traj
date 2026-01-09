@@ -4,7 +4,12 @@
     <option name="autoReloadType" value="SELECTIVE" />
   </component>
   <component name="ChangeListManager">
-    <list default="true" id="983d1f42-2c94-4bb0-b5f1-83b179f29dfc" name="更改" comment="" />
+    <list default="true" id="983d1f42-2c94-4bb0-b5f1-83b179f29dfc" name="更改" comment="">
+      <change beforePath="$PROJECT_DIR$/.idea/workspace.xml" beforeDir="false" afterPath="$PROJECT_DIR$/.idea/workspace.xml" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/src/simulation/example_ik_brush_trajectory.py" beforeDir="false" afterPath="$PROJECT_DIR$/src/simulation/example_ik_brush_trajectory.py" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/src/simulation/render/render_usd_to_video.py" beforeDir="false" afterPath="$PROJECT_DIR$/src/simulation/render/render_usd_to_video.py" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/src/simulation/xpbd_warp_diff.py" beforeDir="false" afterPath="$PROJECT_DIR$/src/simulation/xpbd_warp_diff.py" afterDir="false" />
+    </list>
     <option name="SHOW_DIALOG" value="false" />
     <option name="HIGHLIGHT_CONFLICTS" value="true" />
     <option name="HIGHLIGHT_NON_ACTIVE_CHANGELIST" value="false" />
@@ -41,24 +46,24 @@
     <option name="hideEmptyMiddlePackages" value="true" />
     <option name="showLibraryContents" value="true" />
   </component>
-  <component name="PropertiesComponent"><![CDATA[{
-  "keyToString": {
-    "Python.acc_video.executor": "Run",
-    "Python.check_pt.executor": "Debug",
-    "Python.example_ik_brush_trajectory.executor": "Run",
-    "Python.extract_pt.executor": "Run",
-    "Python.xpbd_warp_diff.executor": "Run",
-    "RunOnceActivity.ShowReadmeOnStart": "true",
-    "git-widget-placeholder": "new",
-    "last_opened_file_path": "E:/Study/Wangxuan/CalliMaster/project/predict_traj/utils",
-    "node.js.detected.package.eslint": "true",
-    "node.js.detected.package.tslint": "true",
-    "node.js.selected.package.eslint": "(autodetect)",
-    "node.js.selected.package.tslint": "(autodetect)",
-    "nodejs_package_manager_path": "npm",
-    "vue.rearranger.settings.migration": "true"
+  <component name="PropertiesComponent">{
+  &quot;keyToString&quot;: {
+    &quot;Python.acc_video.executor&quot;: &quot;Run&quot;,
+    &quot;Python.check_pt.executor&quot;: &quot;Debug&quot;,
+    &quot;Python.example_ik_brush_trajectory.executor&quot;: &quot;Run&quot;,
+    &quot;Python.extract_pt.executor&quot;: &quot;Run&quot;,
+    &quot;Python.xpbd_warp_diff.executor&quot;: &quot;Run&quot;,
+    &quot;RunOnceActivity.ShowReadmeOnStart&quot;: &quot;true&quot;,
+    &quot;git-widget-placeholder&quot;: &quot;main&quot;,
+    &quot;last_opened_file_path&quot;: &quot;E:/Study/Wangxuan/CalliMaster/project/predict_traj/utils&quot;,
+    &quot;node.js.detected.package.eslint&quot;: &quot;true&quot;,
+    &quot;node.js.detected.package.tslint&quot;: &quot;true&quot;,
+    &quot;node.js.selected.package.eslint&quot;: &quot;(autodetect)&quot;,
+    &quot;node.js.selected.package.tslint&quot;: &quot;(autodetect)&quot;,
+    &quot;nodejs_package_manager_path&quot;: &quot;npm&quot;,
+    &quot;vue.rearranger.settings.migration&quot;: &quot;true&quot;
   }
-}]]></component>
+}</component>
   <component name="RecentsManager">
     <key name="CopyFile.RECENT_KEYS">
       <recent name="E:\Study\Wangxuan\CalliMaster\project\predict_traj\utils" />
@@ -103,7 +108,7 @@
       <option name="ADD_SOURCE_ROOTS" value="true" />
       <EXTENSION ID="PythonCoverageRunConfigurationExtension" runner="coverage.py" />
       <option name="SCRIPT_NAME" value="$PROJECT_DIR$/src/simulation/example_ik_brush_trajectory.py" />
-      <option name="PARAMETERS" value="--resample_dist 0.01 --xpbd_iterations 1000  --viewer null --num-frames 10000" />
+      <option name="PARAMETERS" value="--resample_dist 0.01 --xpbd_iterations 1000" />
       <option name="SHOW_COMMAND_LINE" value="false" />
       <option name="EMULATE_TERMINAL" value="false" />
       <option name="MODULE_MODE" value="false" />
@@ -140,6 +145,8 @@
       <workItem from="1767531069663" duration="1804000" />
       <workItem from="1767689572342" duration="33359000" />
       <workItem from="1767862583180" duration="1322000" />
+      <workItem from="1767864284817" duration="10308000" />
+      <workItem from="1767932678671" duration="7588000" />
     </task>
     <servers />
   </component>
@@ -151,22 +158,22 @@
       <breakpoints>
         <line-breakpoint enabled="true" suspend="THREAD" type="python-line">
           <url>file://$PROJECT_DIR$/src/simulation/example_ik_brush_trajectory.py</url>
-          <line>1474</line>
+          <line>1567</line>
           <option name="timeStamp" value="4" />
         </line-breakpoint>
         <line-breakpoint enabled="true" suspend="THREAD" type="python-line">
           <url>file://$PROJECT_DIR$/src/simulation/example_ik_brush_trajectory.py</url>
-          <line>1480</line>
+          <line>1573</line>
           <option name="timeStamp" value="5" />
         </line-breakpoint>
         <line-breakpoint enabled="true" suspend="THREAD" type="python-line">
           <url>file://$PROJECT_DIR$/src/simulation/example_ik_brush_trajectory.py</url>
-          <line>1776</line>
+          <line>1869</line>
           <option name="timeStamp" value="8" />
         </line-breakpoint>
         <line-breakpoint enabled="true" suspend="THREAD" type="python-line">
           <url>file://$PROJECT_DIR$/src/simulation/example_ik_brush_trajectory.py</url>
-          <line>1142</line>
+          <line>1185</line>
           <option name="timeStamp" value="11" />
         </line-breakpoint>
         <line-breakpoint enabled="true" suspend="THREAD" type="python-line">
@@ -186,13 +193,13 @@
         </line-breakpoint>
         <line-breakpoint enabled="true" suspend="THREAD" type="python-line">
           <url>file://$PROJECT_DIR$/src/simulation/example_ik_brush_trajectory.py</url>
-          <line>254</line>
-          <option name="timeStamp" value="18" />
+          <line>330</line>
+          <option name="timeStamp" value="22" />
         </line-breakpoint>
         <line-breakpoint enabled="true" suspend="THREAD" type="python-line">
           <url>file://$PROJECT_DIR$/src/simulation/example_ik_brush_trajectory.py</url>
-          <line>294</line>
-          <option name="timeStamp" value="22" />
+          <line>579</line>
+          <option name="timeStamp" value="24" />
         </line-breakpoint>
       </breakpoints>
     </breakpoint-manager>
@@ -201,7 +208,7 @@
     <SUITE FILE_PATH="coverage/predict_traj$extract_pt.coverage" NAME="extract_pt 覆盖结果" MODIFIED="1767702067708" SOURCE_PROVIDER="com.intellij.coverage.DefaultCoverageFileProvider" RUNNER="coverage.py" COVERAGE_BY_TEST_ENABLED="false" COVERAGE_TRACING_ENABLED="false" WORKING_DIRECTORY="$PROJECT_DIR$/utils" />
     <SUITE FILE_PATH="coverage/predict_traj$xpbd_warp_diff.coverage" NAME="xpbd_warp_diff 覆盖结果" MODIFIED="1767113870485" SOURCE_PROVIDER="com.intellij.coverage.DefaultCoverageFileProvider" RUNNER="coverage.py" COVERAGE_BY_TEST_ENABLED="false" COVERAGE_TRACING_ENABLED="false" WORKING_DIRECTORY="$PROJECT_DIR$/src/simulation" />
     <SUITE FILE_PATH="coverage/predict_traj$acc_video.coverage" NAME="acc_video 覆盖结果" MODIFIED="1767111873256" SOURCE_PROVIDER="com.intellij.coverage.DefaultCoverageFileProvider" RUNNER="coverage.py" COVERAGE_BY_TEST_ENABLED="false" COVERAGE_TRACING_ENABLED="false" WORKING_DIRECTORY="$PROJECT_DIR$/utils" />
-    <SUITE FILE_PATH="coverage/predict_traj$example_ik_brush_trajectory.coverage" NAME="example_ik_brush_trajectory 覆盖结果" MODIFIED="1767743751054" SOURCE_PROVIDER="com.intellij.coverage.DefaultCoverageFileProvider" RUNNER="coverage.py" COVERAGE_BY_TEST_ENABLED="false" COVERAGE_TRACING_ENABLED="false" WORKING_DIRECTORY="$PROJECT_DIR$/src/simulation" />
+    <SUITE FILE_PATH="coverage/predict_traj$example_ik_brush_trajectory.coverage" NAME="example_ik_brush_trajectory 覆盖结果" MODIFIED="1767941128842" SOURCE_PROVIDER="com.intellij.coverage.DefaultCoverageFileProvider" RUNNER="coverage.py" COVERAGE_BY_TEST_ENABLED="false" COVERAGE_TRACING_ENABLED="false" WORKING_DIRECTORY="$PROJECT_DIR$/src/simulation" />
     <SUITE FILE_PATH="coverage/predict_traj$check_pt.coverage" NAME="check_pt 覆盖结果" MODIFIED="1767707403936" SOURCE_PROVIDER="com.intellij.coverage.DefaultCoverageFileProvider" RUNNER="coverage.py" COVERAGE_BY_TEST_ENABLED="false" COVERAGE_TRACING_ENABLED="false" WORKING_DIRECTORY="$PROJECT_DIR$/utils" />
   </component>
 </project>

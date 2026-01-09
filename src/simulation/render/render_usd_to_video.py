@@ -97,6 +97,48 @@ def setup_scene(args):
         print(f"Error: USD file not found at {args.usd_path}")
         sys.exit(1)
 
+    # --- 设置特定对象的材质颜色 ---
+    def assign_color(obj_name, color_rgb):
+        """Helper to assign generic material color to an object by name"""
+        # 1. 查找所有匹配名称的对象 (包含 obj_name 的 MESH 对象)
+        targets = []
+        for obj in bpy.data.objects:
+            if obj.type == 'MESH' and (obj_name in obj.name):
+                targets.append(obj)
+        
+        if not targets:
+            print(f"Warning: No mesh objects found matching '{obj_name}'")
+            return
+
+        # 2. 创建或获取材质
+        mat_name = f"Mat_{obj_name}"
+        mat = bpy.data.materials.get(mat_name)
+        if not mat:
+            mat = bpy.data.materials.new(name=mat_name)
+            mat.use_nodes = True
+            bsdf = mat.node_tree.nodes.get("Principled BSDF")
+            if bsdf:
+                bsdf.inputs['Base Color'].default_value = (*color_rgb, 1.0)
+                # 黑色物体 (如墨水) 可以调整粗糙度
+                if color_rgb == (0, 0, 0):
+                    bsdf.inputs['Roughness'].default_value = 0.8
+                    bsdf.inputs['Specular IOR Level'].default_value = 0.2
+
+        # 3. 强制应用材质
+        for obj in targets:
+            # 清空现有材质槽，确保只使用我们的新材质
+            if obj.data.materials:
+                obj.data.materials.clear()
+            
+            obj.data.materials.append(mat)
+            print(f"Success: Assigned material {color_rgb} to '{obj.name}'")
+
+    # Apply user requested colors
+    for i in range(1, 1000):
+        assign_color(f"instance_{i}", (0.0, 0.0, 0.0))       # Black
+    assign_color(f"instance_0.003", (0.0, 0.0, 0.0))       # Black
+    assign_color("instance_0.001", (0.6, 0.4, 0.2)) # Brownish
+
     scene = bpy.context.scene
     
     # --- 帧范围设定逻辑 ---

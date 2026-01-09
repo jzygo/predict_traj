@@ -20,6 +20,39 @@ import os
 import io
 import pickle
 import sys
+
+def setup_best_gpu():
+    import subprocess
+    try:
+        # Query GPU memory usage using nvidia-smi
+        result = subprocess.run(
+            ['nvidia-smi', '--query-gpu=index,memory.free', '--format=csv,nounits,noheader'],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True
+        )
+        if result.returncode != 0:
+            return
+
+        gpu_memory = []
+        for line in result.stdout.strip().split('\n'):
+            if not line.strip(): continue
+            parts = line.split(',')
+            if len(parts) >= 2:
+                idx = parts[0].strip()
+                free_mem = parts[1].strip()
+                gpu_memory.append((int(idx), int(free_mem)))
+
+        # Select GPU with the most free memory
+        if gpu_memory:
+            best_gpu = max(gpu_memory, key=lambda x: x[1])
+            gpu_idx = best_gpu[0]
+            os.environ["CUDA_VISIBLE_DEVICES"] = str(gpu_idx)
+            print(f"Auto-selected GPU {gpu_idx} with {best_gpu[1]} MB free memory.")
+
+    except Exception as e:
+        print(f"Failed to auto-select GPU: {e}")
+
+setup_best_gpu()
+
 import numpy as np
 import warp as wp
 import torch
@@ -52,6 +85,8 @@ try:
     HAS_MATPLOTLIB = True
 except ImportError:
     HAS_MATPLOTLIB = False
+
+WRITING_WORLD_SIZE = 0.06
 
 
 def load_strokes_from_pkl(pkl_path: str, char_key: str = None) -> tuple:
@@ -127,14 +162,15 @@ def load_font_data(data_root: str) -> tuple:
     for stroke in strokes_data[char_key]:
         stroke_temp = stroke
         for i in range(len(stroke_temp)):
-            stroke_temp[i][2] = (stroke_temp[i][2] + 1) / 2 * 20 / 256
+            stroke_temp[i][2] = (stroke_temp[i][2] + 1) / 2 * 20 / 256 * WRITING_WORLD_SIZE * 2
             if stroke_temp[i][2] > max_r:
                 max_r = stroke_temp[i][2]
         stroke_result.append(stroke_temp)
-    for stroke in stroke_result:
-        for i in range(len(stroke)):
-            stroke[i][2] = stroke[i][2] / max_r * BRUSH_RADIUS
+    # for stroke in stroke_result:
+    #     for i in range(len(stroke)):
+    #         stroke[i][2] = stroke[i][2] / max_r * BRUSH_RADIUS
     return stroke_result, image, char_key
+    # return [stroke_result[0], stroke_result[8]], image, char_key
 
 
 def build_brush(root_position: torch.Tensor = None, stick_length: float = 0.3) -> Brush:
@@ -165,8 +201,8 @@ def build_brush(root_position: torch.Tensor = None, stick_length: float = 0.3) -
 
 
 # 毛笔几何参数（与 build_brush 保持一致）
-BRUSH_RADIUS = 0.008  # 毛笔最大半径
-BRUSH_MAX_LENGTH = 0.08  # 毛笔最大长度
+BRUSH_RADIUS = 0.0055  # 毛笔最大半径
+BRUSH_MAX_LENGTH = 0.047  # 毛笔最大长度
 BRUSH_LENGTH_RATIO = 4 / 5  # 锥形部分占比
 
 
@@ -508,6 +544,7 @@ class Example:
         # ------------------------------------------------------------------
         # 尝试多个可能的数据路径
         possible_data_roots = [
+            "../../data/infer_output_zhao",
             "../../data/infer_output_ou",
             "/data1/jizy/output/infer_output",
             "../../data/infer_output",
@@ -563,15 +600,15 @@ class Example:
             if raw_strokes:
                 # 书写区域中心和偏移
                 writing_center = np.array([0.45, 0.0, 0.25])
-                writing_size = 0.12  # 书写区域半大小 (24cm wide square)
+                writing_size = WRITING_WORLD_SIZE  # 书写区域半大小 (24cm wide square)
                 
                 # 计算墨迹画布的边界 (Workspace Bounds)
                 c_off = self.coord_offset
                 
-                min_x = writing_center[0] - writing_size + c_off[0]
-                max_x = writing_center[0] + writing_size + c_off[0]
-                min_y = writing_center[1] - writing_size + c_off[1]
-                max_y = writing_center[1] + writing_size + c_off[1]
+                min_x = writing_center[0] - writing_size * 1.1 + c_off[0]
+                max_x = writing_center[0] + writing_size * 1.1 + c_off[0]
+                min_y = writing_center[1] - writing_size * 1.1 + c_off[1]
+                max_y = writing_center[1] + writing_size * 1.1 + c_off[1]
                 
                 self.canvas_bounds = (min_x, max_x, min_y, max_y)
                 
@@ -586,7 +623,7 @@ class Example:
                 self.use_font_data = True
                 
                 # 书写平面高度（纸面基准高度，用于墨迹渲染）
-                self.ink_plane_z = self.coord_offset[2]
+                self.ink_plane_z = 0.25 + self.coord_offset[2]
                 
                 # 导出笔画可视化
                 print(f"[Debug] Calling visualize_strokes_to_file with char_key={self.char_key}")
@@ -598,8 +635,8 @@ class Example:
                 for i, s in enumerate(self.strokes):
                     z_values = [pt[2] for pt in s]
                     z_min, z_max = min(z_values), max(z_values)
-                    depth_min = self.ink_plane_z - z_max  # 最小下压深度
-                    depth_max = self.ink_plane_z - z_min  # 最大下压深度
+                    depth_min = - self.ink_plane_z + z_max  # 最小下压深度
+                    depth_max = - self.ink_plane_z + z_min  # 最大下压深度
                     print(f"  Stroke {i+1}: {len(s)} points, z range=[{z_min:.4f}, {z_max:.4f}], depth range=[{depth_min:.4f}, {depth_max:.4f}]")
                     
                 # 显示参考图像信息
@@ -932,6 +969,9 @@ class Example:
         self._current_target_quat = np.array([
             raw_target_rotation[0], raw_target_rotation[1], raw_target_rotation[2], raw_target_rotation[3]
         ])
+        
+        # 重置毛笔状态
+        self._reset_brush_state()
 
     def _get_preparing_position(self) -> wp.vec3:
         """笔画开始前的姿态调整/下降位置"""
@@ -1000,6 +1040,9 @@ class Example:
         if self.current_point_idx >= len(current_stroke) - 1:
             self.current_stroke_idx += 1
             
+            # 保存当前进度对比图
+            self._save_final_comparison_image(suffix=f"_stroke_{self.current_stroke_idx}")
+
             if self.current_stroke_idx >= len(self.strokes):
                 # 所有笔画完成
                 self.writing_complete = True
@@ -1329,6 +1372,13 @@ class Example:
         # 生成毛笔毛发和约束
         self.brush.gen_hairs()
         self.brush.gen_constraints()
+
+        # 记录初始粒子相对于根部的偏移（此时笔是竖直向下的）
+        self._initial_particle_offsets = []
+        for p in self.brush.particles:
+            # 使用 clone() 确保保存的是副本
+            offset = p.position - self.brush.root_position
+            self._initial_particle_offsets.append(offset.clone())
         
         print(f"[Brush Physics] Brush created with {len(self.brush.particles)} particles")
         print(f"[Brush Physics] Brush has {len(self.brush.hairs)} hairs")
@@ -1406,6 +1456,49 @@ class Example:
             print(f"  Simulation: {self.brush.max_hairs} hairs × {self.brush.max_particles_per_hair} particles = {sim_total} total")
             print(f"  Rendering:  {render_hairs} hairs × {render_particles} particles = {render_total} total")
             print(f"  Reduction ratio: {render_total / sim_total * 100:.1f}%")
+
+    def _reset_brush_state(self):
+        """重置毛笔状态：粒子回归初始直线形态，并根据当前笔杆方向旋转"""
+        if self.brush is None or self.brush_simulator is None:
+            return
+            
+        # 获取当前笔杆位置（作为毛笔根部）
+        current_root_pos = torch.tensor(self._get_stick_tip_position(), dtype=torch.float64)
+        
+        # 使用当前笔杆的实际旋转，而不是目标旋转
+        # 这样能确保重置后的物理状态与当前画面中的笔杆状态一致，避免非固定粒子产生突变位移
+        # _get_stick_rotation 返回 [x, y, z, w]
+        current_stick_quat = self._get_stick_rotation()
+        q = torch.tensor([current_stick_quat[0], current_stick_quat[1], current_stick_quat[2], current_stick_quat[3]], dtype=torch.float64)
+        
+        # 重置所有粒子位置
+        for i, p in enumerate(self.brush.particles):
+            if i >= len(self._initial_particle_offsets):
+                break
+                
+            offset = self._initial_particle_offsets[i]
+            
+            # 应用四元数旋转：v_rot = v + 2*cross(q.xyz, cross(q.xyz, v) + q.w*v)
+            uv = torch.cross(q[:3], offset)
+            uuv = torch.cross(q[:3], uv)
+            rotated_offset = offset + 2.0 * (q[3] * uv + uuv)
+            
+            p.position = current_root_pos + rotated_offset
+            # 重置速度为0
+            p.velocity = torch.zeros_like(p.velocity)
+            
+        # 同步更新 Brush 对象的根部属性
+        self.brush.root_position = current_root_pos
+        
+        # 同时更新 tangent_vector
+        tangent_init = torch.tensor([0.0, 0.0, -1.0], dtype=torch.float64) # 初始向下
+        uv_t = torch.cross(q[:3], tangent_init)
+        uuv_t = torch.cross(q[:3], uv_t)
+        self.brush.tangent_vector = tangent_init + 2.0 * (q[3] * uv_t + uuv_t)
+        
+        # 重新加载到 Simulator 以重置 GPU 状态 (positions, velocities, constraints)
+        # 传入 keep_ink_canvas=True 避免清除之前的墨迹
+        self.brush_simulator.load_brush(self.brush, keep_ink_canvas=True)
 
     def _get_initial_brush_root_position(self) -> list:
         """获取初始毛笔根部位置（对齐木棍端点）"""
@@ -1781,7 +1874,7 @@ class Example:
         except Exception as e:
             print(f"[Final] Failed to save joint trajectory: {e}")
 
-    def _save_final_comparison_image(self):
+    def _save_final_comparison_image(self, suffix: str = "_final_comparison"):
         """
         保存最终对比图片，包含三个子图：
         1. 数据中的真值图片（reference_image）
@@ -1792,7 +1885,7 @@ class Example:
             print("[Final] matplotlib not available, skipping final comparison image")
             return
         
-        print("[Final] Saving final comparison image...")
+        print(f"[Final] Saving comparison image ({suffix})...")
         
         # 创建输出目录
         output_dir = Path("stroke_visualizations")
@@ -1888,9 +1981,9 @@ class Example:
         plt.tight_layout()
         
         # 保存图片
-        output_path = output_dir / f"{char_key}_final_comparison.png"
+        output_path = output_dir / f"{char_key}{suffix}.png"
         plt.savefig(str(output_path), dpi=150, bbox_inches='tight')
-        print(f"[Final] Saved final comparison image to: {output_path.resolve()}")
+        print(f"[Final] Saved comparison image to: {output_path.resolve()}")
         plt.close()
 
     def render(self):
