@@ -1,19 +1,6 @@
 # SPDX-FileCopyrightText: Copyright (c) 2025 The Newton Developers
 # SPDX-License-Identifier: Apache-2.0
 
-###########################################################################
-# Example: Calligraphy Writing (机械臂书法书写)
-#
-# 从字体数据集加载汉字笔画轨迹，让机械臂像人握毛笔一样书写
-# - 从 pkl 文件读取笔画轨迹数据
-# - 将笔画坐标转换为机械臂目标点
-# - 笔杆向书写方向（运动方向）倾斜
-# - 支持多笔画顺序书写，笔画间抬笔过渡
-#
-# Command: python newton/examples/ik/example_ik_calligraphy.py
-#          python newton/examples/ik/example_ik_calligraphy.py --offset 0.0 0.0 -0.1
-###########################################################################
-
 import argparse
 import math
 import os
@@ -153,6 +140,7 @@ def load_font_data(data_root: str) -> tuple:
     import random
     char_key = random.choice(common_keys)
     char_key = "下载 (1)"
+    # char_key = "debug"
     # 解码图像
     img_bytes = images_data[char_key]
     image = Image.open(io.BytesIO(img_bytes)).convert('RGB')
@@ -162,15 +150,15 @@ def load_font_data(data_root: str) -> tuple:
     for stroke in strokes_data[char_key]:
         stroke_temp = stroke
         for i in range(len(stroke_temp)):
-            stroke_temp[i][2] = (stroke_temp[i][2] + 1) / 2 * 20 / 256 * WRITING_WORLD_SIZE * 2
+            stroke_temp[i][2] = (stroke_temp[i][2] + 1) / 2 * 20 / 256 * WRITING_WORLD_SIZE * 4
             if stroke_temp[i][2] > max_r:
                 max_r = stroke_temp[i][2]
         stroke_result.append(stroke_temp)
     # for stroke in stroke_result:
     #     for i in range(len(stroke)):
     #         stroke[i][2] = stroke[i][2] / max_r * BRUSH_RADIUS
-    return stroke_result, image, char_key
-    # return [stroke_result[0], stroke_result[8]], image, char_key
+    # return stroke_result, image, char_key
+    return [stroke_result[1], stroke_result[8]], image, char_key
 
 
 def build_brush(root_position: torch.Tensor = None, stick_length: float = 0.3) -> Brush:
@@ -191,11 +179,11 @@ def build_brush(root_position: torch.Tensor = None, stick_length: float = 0.3) -
         radius=BRUSH_RADIUS,
         max_length=BRUSH_MAX_LENGTH,
         max_hairs=500,
-        max_particles_per_hair=20,
+        max_particles_per_hair=30,
         thickness=0.005,  # 毛发粗细
         root_position=root_position,
         tangent_vector=torch.tensor([0.0, 0.0, -1.0], dtype=torch.float64),  # 向下
-        length_ratio=4 / 5,
+        length_ratio=BRUSH_LENGTH_RATIO,
     )
     return brush
 
@@ -203,44 +191,47 @@ def build_brush(root_position: torch.Tensor = None, stick_length: float = 0.3) -
 # 毛笔几何参数（与 build_brush 保持一致）
 BRUSH_RADIUS = 0.0055  # 毛笔最大半径
 BRUSH_MAX_LENGTH = 0.047  # 毛笔最大长度
-BRUSH_LENGTH_RATIO = 4 / 5  # 锥形部分占比
+BRUSH_LENGTH_RATIO = 9 / 10  # 锥形部分占比
+TILT_ANGLE = 0.0
+MAGIC_NUMBER_B = 0.0
+MAGIC_NUMBER_K = 1.0
 
 
 def compute_brush_depth_from_radius(target_radius: float,
-                                     brush_radius: float = BRUSH_RADIUS,
-                                     brush_max_length: float = BRUSH_MAX_LENGTH,
-                                     brush_length_ratio: float = BRUSH_LENGTH_RATIO) -> float:
-    """
-    根据目标切面半径计算毛笔需要下压的深度
-
-    毛笔形状为锥形，中心毛发最长(max_length)，边缘毛发较短。
-    根据 brush.py 中的毛发长度公式：
-        length = max_length * (1 - current_radius/radius) * length_ratio + max_length * (1 - length_ratio)
-
-    可推导出切面半径 r 与下压深度 d 的关系：
-        d = r * max_length * length_ratio / radius
-
-    Args:
-        target_radius: 目标切面半径（毛笔与纸面接触的圆形切面半径）
-        brush_radius: 毛笔最大半径
-        brush_max_length: 毛笔最大长度
-        brush_length_ratio: 锥形部分占比
-
-    Returns:
-        下压深度（从笔尖刚接触纸面算起）
-    """
+                                    brush_radius: float = BRUSH_RADIUS,
+                                    brush_max_length: float = BRUSH_MAX_LENGTH,
+                                    brush_length_ratio: float = BRUSH_LENGTH_RATIO) -> float:
     # 限制目标半径不超过毛笔最大半径
-    target_radius = min(target_radius, brush_radius)
-    target_radius = max(target_radius, 0.0)
+    tan_alpha = brush_radius / (brush_max_length * brush_length_ratio)
+    alpha = math.atan(tan_alpha)
+    max_r = brush_radius * math.sqrt(
+        math.cos(alpha + math.radians(TILT_ANGLE)) / math.cos(alpha - math.radians(TILT_ANGLE)))
+    target_radius = min(target_radius, max_r)
+    target_radius = max(target_radius, 0)
+
+    H = brush_max_length * brush_length_ratio
+
+    theta_rad = math.radians(TILT_ANGLE)
+
+    cos_theta = math.cos(theta_rad)
+    sin_theta = math.sin(theta_rad)
+
+    term_inside_sqrt = (H ** 2 / BRUSH_RADIUS ** 2) * (cos_theta ** 2) - (sin_theta ** 2)
+
+    term1 = H * cos_theta
+
+    term2 = target_radius * math.sqrt(term_inside_sqrt)
+
+    d = term1 - term2 * MAGIC_NUMBER_K + (brush_max_length - H) + brush_max_length / (WRITING_WORLD_SIZE * 2) * MAGIC_NUMBER_B # 最后一个数字是经验参数
 
     # 计算下压深度：d = r * max_length * length_ratio / radius
-    depth = target_radius * brush_max_length * brush_length_ratio / brush_radius
-    
-    return depth
+    # depth = target_radius * brush_max_length * brush_length_ratio / brush_radius
+
+    return d
 
 
 def normalize_strokes_to_workspace(strokes: list, 
-                                    center: np.ndarray = np.array([0.4, 0.0, 0.5]),
+                                    center: np.ndarray = np.array([0.45, 0.0, 0.25]),
                                     size: float = 0.15,
                                     offset: np.ndarray = None,
                                     brush_radius: float = BRUSH_RADIUS,
@@ -323,9 +314,7 @@ def normalize_strokes_to_workspace(strokes: list,
                     brush_max_length=brush_max_length,
                     brush_length_ratio=brush_length_ratio
                 )
-                # 目标高度 = 纸面高度 + 毛笔长度 - 下压深度
-                # z 越小表示下压越深，但始终高于纸面
-                robot_z = base_z + brush_max_length - depth
+                robot_z = base_z + depth
             else:
                 # 如果没有第三维数据，使用笔尖刚接触纸面的高度
                 robot_z = base_z + brush_max_length
@@ -544,7 +533,9 @@ class Example:
         # ------------------------------------------------------------------
         # 尝试多个可能的数据路径
         possible_data_roots = [
+            "/home/jizy/project/video_tokenizer/data/test/debug",
             "../../data/infer_output_zhao",
+            "../../data/debug",
             "../../data/infer_output_ou",
             "/data1/jizy/output/infer_output",
             "../../data/infer_output",
@@ -585,7 +576,10 @@ class Example:
                 resampled_strokes = []
                 for i, stroke in enumerate(raw_strokes):
                     stroke_np = np.array(stroke)
-                    print(f"[Stroke Info] Stroke {i}: r range = {stroke_np[:,2].min():.4f} to {stroke_np[:,2].max():.4f}")
+                    stroke_r_record = ""
+                    for point in stroke_np:
+                        stroke_r_record += f"{point[2]:.6f}, "
+                    print(f"[Stroke Info] Stroke {i}: r range = {stroke_np[:,2].min():.4f} to {stroke_np[:,2].max():.4f}, r values = [{stroke_r_record}]")
                     original_len = len(stroke_np)
                     # 使用 resample_stroke_by_dist 进行弧长重采样（只使用 x, y 坐标）
                     resampled = resample_stroke_by_dist(stroke_np, step_size=self.resample_dist, point_dim=2)
@@ -661,7 +655,7 @@ class Example:
         self.lift_height = 0.08      # 抬笔高度
         self.is_preparing = False    # 笔画开始前的准备（姿态调整+下降）
         self.prepare_progress = 0.0  # 准备进度 [0, 1]
-        self.prepare_speed = 0.02   # 准备阶段推进速度（越小越慢，可拉长调整时间）
+        self.prepare_speed = 0.01   # 准备阶段推进速度（越小越慢，可拉长调整时间）
         self.points_per_frame = 0.1  # 每帧前进的点数（控制书写速度）; 越小越慢 (0.5=原速, 0.1=5倍慢)
         self.point_accumulator = 0.0 # 点累加器（用于非整数速度）
         
@@ -712,8 +706,8 @@ class Example:
         # 渲染: render_hairs=100, render_particles_per_hair=10 (共1000粒子)
         # ------------------------------------------------------------------
         self.render_downsample_enabled = True  # 是否启用渲染降采样
-        self.render_hairs = 100  # 渲染时使用的毛发数量
-        self.render_particles_per_hair = 10  # 渲染时每根毛发的粒子数量
+        self.render_hairs = 300  # 渲染时使用的毛发数量
+        self.render_particles_per_hair = 20  # 渲染时每根毛发的粒子数量
         self._render_hair_indices = None  # 缓存：用于渲染的毛发索引
         self._render_particle_indices = None  # 缓存：用于渲染的粒子索引（相对于每根毛发）
         self._render_global_indices = None  # 缓存：用于渲染的全局粒子索引（预计算，避免每帧循环）
@@ -721,7 +715,7 @@ class Example:
         # ------------------------------------------------------------------
         # 笔杆倾斜参数
         # ------------------------------------------------------------------
-        self.tilt_angle = math.radians(10.0)  # 20度倾斜
+        self.tilt_angle = math.radians(TILT_ANGLE)
 
         # 用于平滑方向变化的参数
         self._prev_target = None
@@ -759,7 +753,7 @@ class Example:
         # IK 权重/迭代参数
         # ------------------------------------------------------------------
         self.pos_weight = 20.0
-        self.rot_weight = 0.5
+        self.rot_weight = 5.0
         self.joint_limit_weight = 1.0
 
         # ------------------------------------------------------------------
@@ -797,16 +791,7 @@ class Example:
         ee_rot = body_q_np[self.ee_index, 3:7]
         self.base_rotation = np.array([ee_rot[0], ee_rot[1], ee_rot[2], ee_rot[3]])
         self.target_rotation = wp.vec4(ee_rot[0], ee_rot[1], ee_rot[2], ee_rot[3])
-        
-        # ------------------------------------------------------------------
-        # 初始化毛笔物理仿真（需要在 ee_index 设置之后）
-        # ------------------------------------------------------------------
-        if self.enable_brush_physics:
-            self._initialize_brush_simulation()
 
-        # 初始：如果有字体数据，先在起笔上方进行姿态准备（需在 base_rotation 定义后）
-        if self.use_font_data and len(self.strokes) > 0:
-            self._enter_prepare_for_stroke(0)
 
         # ------------------------------------------------------------------
         # IK setup
@@ -845,6 +830,107 @@ class Example:
             lambda_initial=0.1,
             jacobian_mode=ik.IKJacobianMode.ANALYTIC,
         )
+
+        # ------------------------------------------------------------------
+        # 机械臂 Warm Up：在仿真开始前将机械臂移动到第一个笔画起点上方
+        # 这样机械臂一加载好，关节角度就已经是目标位置的结果
+        # ------------------------------------------------------------------
+        # self._warmup_robot_to_initial_position()
+        # ------------------------------------------------------------------
+        # 初始化毛笔物理仿真（需要在 ee_index 设置之后）
+        # ------------------------------------------------------------------
+        if self.enable_brush_physics:
+            self._initialize_brush_simulation()
+
+        # 初始：如果有字体数据，先在起笔上方进行姿态准备（需在 base_rotation 定义后）
+        if self.use_font_data and len(self.strokes) > 0:
+            self._enter_prepare_for_stroke(0)
+
+    def _warmup_robot_to_initial_position(self):
+        """
+        机械臂 Warm Up：通过多次 IK 迭代将机械臂移动到第一个笔画起点上方
+        使得仿真开始时机械臂已经处于正确位置，避免初始移动过程
+        """
+        if not self.use_font_data or len(self.strokes) == 0:
+            print("[Warm Up] No font data, skipping warm up")
+            return
+        
+        print("[Warm Up] Starting robot warm up to initial position...")
+        
+        # 获取初始目标位置（第一个笔画第一个点上方）
+        initial_target = self._get_initial_target()
+        
+        # 计算初始姿态方向（基于第一笔的运动方向）
+        if len(self.strokes[0]) >= 2:
+            p0 = np.array(self.strokes[0][0], dtype=np.float32)
+            p1 = np.array(self.strokes[0][1], dtype=np.float32)
+            dir_vec = p1 - p0
+            dir_vec[2] = 0.0
+            norm = np.linalg.norm(dir_vec)
+            if norm > 1e-6:
+                dir_vec = dir_vec / norm
+            else:
+                dir_vec = np.array([1.0, 0.0, 0.0], dtype=np.float32)
+        else:
+            dir_vec = np.array([1.0, 0.0, 0.0], dtype=np.float32)
+        
+        # 计算目标旋转姿态
+        target_rotation = self._compute_tilt_rotation(dir_vec)
+        
+        # 更新 IK 目标
+        self.pos_obj.set_target_position(0, initial_target)
+        if self.enable_rotation_objective:
+            self.rot_obj.set_target_rotation(0, target_rotation)
+        
+        # 执行多次 IK 求解，确保收敛
+        warmup_iterations = 100  # warm up 的外层迭代次数
+        warmup_ik_iters = 1000   # 每次 warm up 的 IK 迭代次数
+        
+        for i in range(warmup_iterations):
+            try:
+                self.joint_q = wp.array(self.model.joint_q, shape=(1, self.model.joint_coord_count), device=self.viewer.device)
+            except TypeError:
+                self.joint_q = wp.array(self.model.joint_q, shape=(1, self.model.joint_coord_count))
+            
+            self.solver.step(self.joint_q, self.joint_q, iterations=warmup_ik_iters)
+            
+            # 获取求解结果并直接设置为模型关节角
+            solved_q = self.joint_q.numpy().reshape(-1)
+            self.model.joint_q = wp.array(solved_q, dtype=wp.float32, device=self.viewer.device)
+            
+            # 更新前向运动学
+            newton.eval_fk(self.model, self.model.joint_q, self.model.joint_qd, self.state)
+        
+        # 获取最终关节角度
+        final_q = self.model.joint_q.numpy()
+        
+        # 初始化平滑参数为 warm up 结果，避免仿真开始时的突变
+        self._prev_joint_q = final_q.copy()
+        self._prev_joint_velocity = np.zeros_like(final_q)
+        
+        # 初始化目标位置平滑参数
+        self._smoothed_target_pos = np.array([float(initial_target[0]), float(initial_target[1]), float(initial_target[2])])
+        self._prev_target = self._smoothed_target_pos.copy()
+        
+        # 初始化旋转平滑参数
+        self._current_target_quat = np.array([target_rotation[0], target_rotation[1], target_rotation[2], target_rotation[3]])
+        
+        # 验证末端执行器位置
+        body_q_np = self.state.body_q.numpy()
+        ee_pos = body_q_np[self.ee_index, 0:3]
+        
+        # 计算木棍末端位置（需要考虑旋转）
+        ee_rot = body_q_np[self.ee_index, 3:7]
+        stick_offset_np = np.array([0.0, 0.0, self.stick_length])
+        stick_tip_pos = ee_pos + self._rotate_vector(stick_offset_np, ee_rot)
+        
+        target_np = np.array([float(initial_target[0]), float(initial_target[1]), float(initial_target[2])])
+        distance = np.linalg.norm(stick_tip_pos - target_np)
+        
+        print(f"[Warm Up] Completed!")
+        print(f"  Target position: [{target_np[0]:.4f}, {target_np[1]:.4f}, {target_np[2]:.4f}]")
+        print(f"  Stick tip position: [{stick_tip_pos[0]:.4f}, {stick_tip_pos[1]:.4f}, {stick_tip_pos[2]:.4f}]")
+        print(f"  Position error: {distance:.6f} m")
 
     def _get_initial_target(self) -> wp.vec3:
         """获取初始目标位置"""
@@ -971,7 +1057,8 @@ class Example:
         ])
         
         # 重置毛笔状态
-        self._reset_brush_state()
+        if stroke_idx != 0:
+            self._reset_brush_state()
 
     def _get_preparing_position(self) -> wp.vec3:
         """笔画开始前的姿态调整/下降位置"""
@@ -1343,7 +1430,7 @@ class Example:
     def _create_brush_particle_mesh(self):
         """创建毛笔粒子的球体 mesh"""
         from newton.utils import create_sphere_mesh
-        vertices, indices = create_sphere_mesh(0.003)  # 毛笔粒子
+        vertices, indices = create_sphere_mesh(0.0005)  # 毛笔粒子
 
         points = wp.array(vertices[:, 0:3], dtype=wp.vec3, device=self.viewer.device)
         normals = wp.array(vertices[:, 3:6], dtype=wp.vec3, device=self.viewer.device)
@@ -1395,7 +1482,7 @@ class Example:
             total_trajectory_points = 10000  # 默认轨迹
         
         # 确保最小步数
-        num_sim_steps = max(total_trajectory_points * 2, 10000)
+        num_sim_steps = max(total_trajectory_points * 2, 1000)
         
         min_x, max_x, min_y, max_y = self.canvas_bounds
         print(f"[Brush Physics] Canvas Bounds: X[{min_x:.3f}, {max_x:.3f}], Y[{min_y:.3f}, {max_y:.3f}]")
@@ -1899,7 +1986,42 @@ class Example:
         # ========== 子图1：真值图片 ==========
         ax1 = axes[0]
         if self.reference_image is not None:
-            ax1.imshow(self.reference_image)
+            # 将图片转换为 numpy 数组以便后续处理
+            ref_img_np = np.array(self.reference_image)
+            
+            # 如果是白底黑字，尝试裁剪到文字区域
+            try:
+                # 转换为灰度图计算边界
+                if ref_img_np.ndim == 3:
+                    gray_img = np.mean(ref_img_np, axis=2)
+                else:
+                    gray_img = ref_img_np
+                
+                # 寻找非白色像素 (假设阈值为 240)
+                non_white_indices = np.where(gray_img < 240)
+                
+                if len(non_white_indices[0]) > 0:
+                    y_min, y_max = np.min(non_white_indices[0]), np.max(non_white_indices[0])
+                    x_min, x_max = np.min(non_white_indices[1]), np.max(non_white_indices[1])
+                    
+                    # 增加一点边缘留白 (padding)
+                    pad = 10
+                    h, w = gray_img.shape
+                    y_min = max(0, y_min - pad)
+                    y_max = min(h, y_max + pad)
+                    x_min = max(0, x_min - pad)
+                    x_max = min(w, x_max + pad)
+                    
+                    # 裁剪图片
+                    cropped_img = ref_img_np[y_min:y_max, x_min:x_max]
+                    ax1.imshow(cropped_img)
+                else:
+                    # 如果找不到黑色像素，显示原图
+                    ax1.imshow(self.reference_image)
+            except Exception as e:
+                print(f"Warning: Failed to crop reference image: {e}")
+                ax1.imshow(self.reference_image)
+                
             ax1.set_title(f"Ground Truth - {char_key}", fontsize=12, fontweight='bold')
         else:
             ax1.text(0.5, 0.5, "No reference image", ha='center', va='center', fontsize=14)
@@ -1947,28 +2069,66 @@ class Example:
         # ========== 子图3：处理后的轨迹数据 ==========
         ax3 = axes[2]
         if self.strokes and len(self.strokes) > 0:
-            # 绘制归一化后的笔画（参考 GB45_normalized_strokes.png 的风格）
+            # 计算 r 值进行可视化
+            base_z = 0.25 + self.coord_offset[2]
+            
+            from matplotlib.collections import PatchCollection
+            
+            # 为每个笔画分配颜色
             colors = plt.cm.jet(np.linspace(0, 1, len(self.strokes)))
+
+            all_points = []
+
             for i, stroke in enumerate(self.strokes):
                 stroke_np = np.array(stroke)
-                # 只取 x, y（忽略 z）
                 xy = stroke_np[:, :2]
+                z_vals = stroke_np[:, 2]
+                if len(xy) == 0: continue
+                
+                all_points.append(xy)
+                
+                # 计算 r 值 (保持原有逻辑)
+                depths = - (z_vals - base_z - BRUSH_MAX_LENGTH)
+                r_vals = (depths) * BRUSH_RADIUS / (BRUSH_MAX_LENGTH * BRUSH_LENGTH_RATIO)
+                r_vals = np.maximum(r_vals, 0) # 确保半径非负
+                
+                # 创建圆的 Patch 集合
+                circle_patches = []
+                record_stroke_r = ""
+                for j in range(len(xy)):
+                    if r_vals[j] > 1e-5: # 忽略太小的圆
+                        record_stroke_r += f"{r_vals[j]:.4f}, "
+                        circle = patches.Circle((xy[j, 0], xy[j, 1]), r_vals[j])
+                        circle_patches.append(circle)
+                print(f"[Final] Stroke {i+1} radii: {record_stroke_r}")
+                
+                if circle_patches:
+                    # 使用 PatchCollection 提高性能
+                    p = PatchCollection(circle_patches, alpha=0.3, facecolor=colors[i], edgecolor='none')
+                    ax3.add_collection(p)
+                
+                # 绘制中心轨迹线
                 if len(xy) > 1:
-                    ax3.plot(xy[:, 0], xy[:, 1], 
-                            color=colors[i], linewidth=2.5, label=f"Stroke {i+1}", zorder=2)
+                    ax3.plot(xy[:, 0], xy[:, 1], color='gray', alpha=0.5, linewidth=0.5, zorder=2)
+                
                 # 标记起点
-                ax3.scatter(xy[0, 0], xy[0, 1], 
-                          color=colors[i], s=80, marker='o', edgecolors='white', 
-                          linewidths=2, zorder=3)
-            
+                ax3.text(xy[0, 0], xy[0, 1], str(i+1), color='red', fontsize=10, fontweight='bold', zorder=3)
+
             ax3.set_aspect('equal')
-            ax3.set_title(f"Normalized Strokes (Robot Coords) - {char_key}", fontsize=12, fontweight='bold')
+            ax3.set_title(f"Visualized Radius (r) - {char_key}", fontsize=12, fontweight='bold')
             ax3.set_xlabel("X (robot coords)")
             ax3.set_ylabel("Y (robot coords)")
             ax3.grid(True, alpha=0.3)
-            # 图例放在图外
-            if len(self.strokes) <= 10:
-                ax3.legend(fontsize=8, loc='upper left')
+            
+            # 手动更新坐标轴范围 (add_collection 不会自动更新)
+            if all_points:
+                all_points_np = np.concatenate(all_points)
+                x_min, x_max = all_points_np[:, 0].min(), all_points_np[:, 0].max()
+                y_min, y_max = all_points_np[:, 1].min(), all_points_np[:, 1].max()
+                margin = 0.02
+                ax3.set_xlim(x_min - margin, x_max + margin)
+                ax3.set_ylim(y_min - margin, y_max + margin)
+
         else:
             ax3.text(0.5, 0.5, "No stroke data", ha='center', va='center', fontsize=14)
             ax3.set_title("Normalized Strokes (N/A)", fontsize=12, fontweight='bold')

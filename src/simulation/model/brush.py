@@ -105,7 +105,7 @@ class Brush:
             hair.gen_particles(self.max_particles_per_hair)
             for particle in hair.particles:
                 dis = torch.norm(particle.position - hair.root_position).item()
-                if dis < 1/10 * self.max_length:
+                if dis < 1 / 10 * self.max_length:
                     self.constraints.append(FixedPointConstraint(particle))
             self.hairs.append(hair)
             hair.gen_constraints()
