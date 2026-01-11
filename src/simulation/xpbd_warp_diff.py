@@ -532,6 +532,15 @@ def process_ink_canvas(
     ink_canvas[batch_id, tid] = (wp.float64(1.0) / (wp.float64(1.0) + wp.exp(-v)) - wp.float64(0.5)) * wp.float64(2)
 
 
+import warp as wp
+
+
+# 假设外部定义了 PLANE_Z，如果没有请自行替换为 0.0 或通过参数传入
+# PLANE_Z = 0.0
+
+import warp as wp
+
+
 @wp.kernel
 def solve_variable_distance_constraints(
         positions: wp.array(dtype=wp.vec3d, ndim=3),
@@ -543,16 +552,12 @@ def solve_variable_distance_constraints(
         lagrange_multipliers: wp.array(dtype=wp.float64),
         deltas_x: wp.array(dtype=wp.float64, ndim=2),
         deltas_y: wp.array(dtype=wp.float64, ndim=2),
-        deltas_z: wp.array(dtype=wp.float64, ndim=2),
+        deltas_z: wp.array(dtype=wp.float64, ndim=2),  # 此参数传入但不再被本函数修改
         dt: wp.float64,
         z_threshold: wp.float64,
         weakness_factor: wp.float64,
         num_constraints: int
 ):
-    """
-    可变距离约束求解器 - 基于z坐标的动态约束强度
-    z离0越近，约束越弱；离开一定距离后，约束强度固定为普通距离约束强度
-    """
     batch_id, tid = wp.tid()
     if tid >= num_constraints:
         return
@@ -564,8 +569,13 @@ def solve_variable_distance_constraints(
     xi = positions[batch_id, time_id, i]
     xj = positions[batch_id, time_id, j]
 
-    # Calculate constraint violation
-    diff = xi - xj
+    # ---------------------------------------------------------
+    # 修改点 1: 计算约束违反时，只考虑 XY 平面
+    # ---------------------------------------------------------
+    # 构造一个新的差分向量，其 Z 分量强制为 0
+    # 这样计算出的 length 就是 2D 平面距离
+    diff = wp.vec3(xi[0] - xj[0], xi[1] - xj[1], 0.0)
+
     current_distance = wp.length(diff)
 
     epsilon = wp.float64(1e-15)
@@ -574,27 +584,22 @@ def solve_variable_distance_constraints(
         return
 
     violation = current_distance - rest_distances[tid]
-    n = diff / current_distance
+    n = diff / current_distance  # 此时 n 的 z 分量也是 0
 
     # Calculate denominator for constraint resolution
     w_sum = inv_masses[batch_id, i] + inv_masses[batch_id, j]
     if w_sum < wp.float64(epsilon):
         return
 
-    # 计算基于z坐标的动态compliance
-    # 取两个点的平均z坐标作为参考
+    # 计算基于z坐标的动态compliance (保留原逻辑，根据物体高度决定刚度)
+    # 注意：这里依然使用原始坐标的 Z 值来判断是否处于"松弛"状态
     avg_z = (xi[2] + xj[2]) * wp.float64(0.5)
     abs_z = wp.abs(avg_z)
 
-    # 动态调整compliance：z离0越近，compliance越大（约束越弱）
     dynamic_compliance = base_compliances[tid]
-    if abs_z > z_threshold + wp.float64(PLANE_Z):
-        # 在阈值范围内，线性插值增加compliance
-        # z_ratio = wp.float64(1.0) - (abs_z / z_threshold)  # z=0时为1, z=threshold时为0
-        # dynamic_compliance = base_compliances[tid] * (wp.float64(1.0) + weakness_factor * z_ratio)
-        dynamic_compliance = wp.float64(1.0)
-        # dynamic_compliance = z_ratio * 1e-1 + base_compliances[tid]
-    # XPBD compliance model with numerical stability
+    # if abs_z > z_threshold + wp.float64(PLANE_Z):
+    #     dynamic_compliance = wp.float64(1.0)
+
     alpha = wp.max(dynamic_compliance / (dt * dt), epsilon)
     denom = w_sum + alpha
 
@@ -617,16 +622,22 @@ def solve_variable_distance_constraints(
     if correction_magnitude > max_correction:
         correction = correction * (max_correction / correction_magnitude)
 
+    # ---------------------------------------------------------
+    # 修改点 2: 应用 Delta 时，只更新 X 和 Y，不更新 Z
+    # ---------------------------------------------------------
+    # correction[2] 已经是 0 了，所以 deltas_z 不需要加，直接注释掉或删除相关代码
+
     if inv_masses[batch_id, i] > wp.float64(0.0):
         ci = inv_masses[batch_id, i] * correction
         wp.atomic_add(deltas_x, batch_id, i, ci[0])
         wp.atomic_add(deltas_y, batch_id, i, ci[1])
-        wp.atomic_add(deltas_z, batch_id, i, ci[2])
+        # wp.atomic_add(deltas_z, batch_id, i, ci[2]) # 移除对 Z 的影响
+
     if inv_masses[batch_id, j] > wp.float64(0.0):
         cj = -inv_masses[batch_id, j] * correction
         wp.atomic_add(deltas_x, batch_id, j, cj[0])
         wp.atomic_add(deltas_y, batch_id, j, cj[1])
-        wp.atomic_add(deltas_z, batch_id, j, cj[2])
+        # wp.atomic_add(deltas_z, batch_id, j, cj[2]) # 移除对 Z 的影响
 
 
 @wp.kernel
@@ -634,8 +645,8 @@ def solve_bending_constraints(
         positions: wp.array(dtype=wp.vec3d, ndim=3),
         time_id: int,
         inv_masses: wp.array(dtype=wp.float64, ndim=2),
-        constraint_indices: wp.array(dtype=wp.vec3i),  # (i, j, k) 三个粒子索引
-        rest_distances: wp.array(dtype=wp.float64),  # i到k的直线距离
+        constraint_indices: wp.array(dtype=wp.vec3i),  # (i, j, k)
+        rest_distances: wp.array(dtype=wp.float64),    # 原有的rest_distance在这里作为参考长度用于截断
         compliances: wp.array(dtype=wp.float64),
         lagrange_multipliers: wp.array(dtype=wp.float64),
         deltas_x: wp.array(dtype=wp.float64, ndim=2),
@@ -645,85 +656,92 @@ def solve_bending_constraints(
         num_constraints: int
 ):
     """
-    弯曲距离约束求解器 - 约束首尾两点的距离以保持直线形态
-
-    对于三个连续粒子 i, j, k，约束 |i-k| = rest_distance
-    其中 rest_distance = |i-j| + |j-k|（直线时的距离）
-
-    这是一个简单的距离约束，比角度约束更加数值稳定
+    改进后的弯曲约束求解器 - 中点约束法
+    约束中间粒子 j 位于 i 和 k 的连线中点（假设毛发分段均匀）
+    C(x) = |xj - (xi + xk) / 2| = 0
     """
     batch_id, tid = wp.tid()
     if tid >= num_constraints:
         return
 
     idx = constraint_indices[tid]
-    i = idx[0]
-    j = idx[1]  # 中间点（不直接参与此约束，但用于记录）
-    k = idx[2]
+    i, j, k = idx[0], idx[1], idx[2]
 
-    # 获取首尾两点的位置
+    # 获取三个粒子的位置
     xi = positions[batch_id, time_id, i]
+    xj = positions[batch_id, time_id, j]
     xk = positions[batch_id, time_id, k]
 
-    # 计算当前距离
-    diff = xi - xk
-    current_distance = wp.length(diff)
+    # 计算目标中点位置 (xi + xk) / 2
+    mid_point = (xi + xk) * wp.float64(0.5)
 
-    epsilon = wp.float64(1e-10)
-    if current_distance < epsilon:
+    # 计算偏差向量 (xj 偏离中点的程度)
+    diff = xj - mid_point
+    current_deviation = wp.length(diff)
+
+    epsilon = wp.float64(1e-12)
+    if current_deviation < epsilon:
         return
 
-    # 约束违背量
-    rest_dist = rest_distances[tid]
-    violation = current_distance - rest_dist
+    # 约束方向：将 xj 推向中点
+    n = diff / current_deviation
+    
+    # 约束值 C = current_deviation (目标是 0)
+    C = current_deviation
 
-    # 如果违背量很小，跳过
-    if wp.abs(violation) < epsilon:
-        return
-
-    # 梯度方向（归一化的连接向量）
-    n = diff / current_distance
-
-    # 计算有效质量
+    # 计算广义逆质量
+    # 梯度: grad_j = n, grad_i = -0.5*n, grad_k = -0.5*n
+    w_j = inv_masses[batch_id, j]
     w_i = inv_masses[batch_id, i]
     w_k = inv_masses[batch_id, k]
-    w_sum = w_i + w_k
+
+    # w_sum = sum(w * |grad|^2)
+    # |grad_j|^2 = 1, |grad_i|^2 = 0.25, |grad_k|^2 = 0.25
+    w_sum = w_j + wp.float64(0.25) * (w_i + w_k)
 
     if w_sum < epsilon:
         return
 
-    # XPBD compliance
+    # XPBD Compliance
     alpha = compliances[tid] / (dt * dt)
-    if alpha < epsilon:
-        alpha = epsilon
     denom = w_sum + alpha
 
     # 计算拉格朗日乘子增量
     prev_lambda = lagrange_multipliers[tid]
-    numerator = -(violation + alpha * prev_lambda)
-    delta_lambda = numerator / denom
+    delta_lambda = (-C - alpha * prev_lambda) / denom
 
-    # 限制最大修正量
-    max_correction = wp.float64(0.1) * rest_dist
-    delta_lambda = wp.clamp(delta_lambda, -max_correction, max_correction)
+    # 稳定性截断：防止单次修正过大 (使用 rest_distances 作为尺度参考)
+    # rest_distances 在 Brush 中被初始化为 |i-k|，大约是 2 倍的段长
+    limit = wp.float64(0.1) * rest_distances[tid]  
+    delta_lambda = wp.clamp(delta_lambda, -limit, limit)
 
     # 更新拉格朗日乘子
     lagrange_multipliers[tid] = prev_lambda + delta_lambda
 
-    # 应用位置修正
-    correction = delta_lambda * n
+    # 计算位置修正量 P = delta_lambda * grad * w
+    # 注意 delta_lambda 通常为负（为了减少 C）
+    
+    # 修正中间点 j (+n 方向)
+    if w_j > wp.float64(0.0):
+        corr_j = delta_lambda * n * w_j
+        wp.atomic_add(deltas_x, batch_id, j, corr_j[0])
+        wp.atomic_add(deltas_y, batch_id, j, corr_j[1])
+        wp.atomic_add(deltas_z, batch_id, j, corr_j[2])
 
+    # 修正两端点 i, k (-0.5n 方向)
+    half_factor = wp.float64(-0.5)
+    
     if w_i > wp.float64(0.0):
-        ci = w_i * correction
-        wp.atomic_add(deltas_x, batch_id, i, ci[0])
-        wp.atomic_add(deltas_y, batch_id, i, ci[1])
-        wp.atomic_add(deltas_z, batch_id, i, ci[2])
+        corr_i = delta_lambda * half_factor * n * w_i
+        wp.atomic_add(deltas_x, batch_id, i, corr_i[0])
+        wp.atomic_add(deltas_y, batch_id, i, corr_i[1])
+        wp.atomic_add(deltas_z, batch_id, i, corr_i[2])
 
     if w_k > wp.float64(0.0):
-        ck = -w_k * correction
-        wp.atomic_add(deltas_x, batch_id, k, ck[0])
-        wp.atomic_add(deltas_y, batch_id, k, ck[1])
-        wp.atomic_add(deltas_z, batch_id, k, ck[2])
+        corr_k = delta_lambda * half_factor * n * w_k
+        wp.atomic_add(deltas_x, batch_id, k, corr_k[0])
+        wp.atomic_add(deltas_y, batch_id, k, corr_k[1])
+        wp.atomic_add(deltas_z, batch_id, k, corr_k[2])
 
 
 @wp.kernel
@@ -1422,26 +1440,26 @@ class XPBDSimulator:
                 )
 
             # Solve bending constraints for hair stiffness
-            # if self.bending_indices is not None and self.num_bending_constraints > 0:
-            #     wp.launch(
-            #         solve_bending_constraints,
-            #         dim=(self.batch_size, self.num_bending_constraints),
-            #         inputs=[
-            #             self.positions,
-            #             time_step,
-            #             self.inv_masses,
-            #             self.bending_indices,
-            #             self.bending_rest_distances,
-            #             self.bending_compliances,
-            #             self.bending_lambdas,
-            #             self._delta_x,
-            #             self._delta_y,
-            #             self._delta_z,
-            #             self.sub_dt,
-            #             self.num_bending_constraints
-            #         ],
-            #         device=self.device
-            #     )
+            if self.bending_indices is not None and self.num_bending_constraints > 0:
+                wp.launch(
+                    solve_bending_constraints,
+                    dim=(self.batch_size, self.num_bending_constraints),
+                    inputs=[
+                        self.positions,
+                        time_step,
+                        self.inv_masses,
+                        self.bending_indices,
+                        self.bending_rest_distances,
+                        self.bending_compliances,
+                        self.bending_lambdas,
+                        self._delta_x,
+                        self._delta_y,
+                        self._delta_z,
+                        self.sub_dt,
+                        self.num_bending_constraints
+                    ],
+                    device=self.device
+                )
 
             # Apply accumulated deltas and clear for next iteration
             wp.launch(

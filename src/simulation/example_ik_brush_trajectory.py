@@ -192,7 +192,7 @@ def build_brush(root_position: torch.Tensor = None, stick_length: float = 0.3) -
 BRUSH_RADIUS = 0.0055  # 毛笔最大半径
 BRUSH_MAX_LENGTH = 0.047  # 毛笔最大长度
 BRUSH_LENGTH_RATIO = 9 / 10  # 锥形部分占比
-TILT_ANGLE = 0.0
+TILT_ANGLE = 20.0
 MAGIC_NUMBER_B = 0.0
 MAGIC_NUMBER_K = 1.0
 
@@ -821,7 +821,7 @@ class Example:
 
         self.joint_q = wp.array(self.model.joint_q, shape=(1, self.model.joint_coord_count))
 
-        self.ik_iters = 200
+        self.ik_iters = 500
         self.solver = ik.IKSolver(
             model=self.model,
             n_problems=1,
@@ -1482,7 +1482,7 @@ class Example:
             total_trajectory_points = 10000  # 默认轨迹
         
         # 确保最小步数
-        num_sim_steps = max(total_trajectory_points * 2, 1000)
+        num_sim_steps = max(total_trajectory_points * 2, 5000)
         
         min_x, max_x, min_y, max_y = self.canvas_bounds
         print(f"[Brush Physics] Canvas Bounds: X[{min_x:.3f}, {max_x:.3f}], Y[{min_y:.3f}, {max_y:.3f}]")
@@ -1497,7 +1497,7 @@ class Example:
             gravity=torch.tensor([0.0, 0.0, -MAX_GRAVITY], dtype=torch.float64),
             dis_compliance=1e-8,
             variable_dis_compliance=1e-8,
-            bending_compliance=1e-7,
+            bending_compliance=1e-6,
             damping=0.3,
             canvas_resolution=256,
             canvas_min_x=min_x,
