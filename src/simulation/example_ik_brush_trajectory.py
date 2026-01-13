@@ -143,7 +143,7 @@ def load_font_data(data_root: str) -> tuple:
     common_keys = sorted(list(set(strokes_data.keys()) & set(images_data.keys())))
     import random
     char_key = random.choice(common_keys)
-    char_key = "下载 (3)"
+    char_key = "下载 (1)"
     # char_key = "debug"
     # 解码图像
     img_bytes = images_data[char_key]
@@ -161,8 +161,8 @@ def load_font_data(data_root: str) -> tuple:
     # for stroke in stroke_result:
     #     for i in range(len(stroke)):
     #         stroke[i][2] = stroke[i][2] / max_r * BRUSH_RADIUS
-    return stroke_result, image, char_key
-    # return [stroke_result[1], stroke_result[8]], image, char_key
+    # return stroke_result, image, char_key
+    return [stroke_result[1], stroke_result[8]], image, char_key
 
 
 def build_brush(root_position: torch.Tensor = None, tangent_vector: torch.Tensor = None, stick_length: float = 0.3) -> Brush:
@@ -514,6 +514,8 @@ class Example:
 
         self.viewer = viewer
 
+        self.first_time = True
+
         # ------------------------------------------------------------------
         # 命令行参数：坐标偏移量
         # ------------------------------------------------------------------
@@ -772,12 +774,20 @@ class Example:
         # Build Franka robot + ground
         # ------------------------------------------------------------------
         franka = newton.ModelBuilder()
-        franka.add_urdf(
-            newton.utils.download_asset("franka_emika_panda") / "urdf/fr3_franka_hand.urdf",
-            # Path("/data1/jizy/newton-assets/franka_emika_panda") / "urdf/fr3_franka_hand.urdf",
-            floating=False,
-        )
-        franka.add_ground_plane()
+        try:
+            franka.add_urdf(
+                # newton.utils.download_asset("franka_emika_panda") / "urdf/fr3_franka_hand.urdf",
+                Path("/data1/jizy/newton-assets/franka_emika_panda") / "urdf/fr3_franka_hand.urdf",
+                floating=False,
+            )
+            franka.add_ground_plane()
+        except Exception as e:
+            franka.add_urdf(
+                newton.utils.download_asset("franka_emika_panda") / "urdf/fr3_franka_hand.urdf",
+                # Path("/data1/jizy/newton-assets/franka_emika_panda") / "urdf/fr3_franka_hand.urdf",
+                floating=False,
+            )
+            franka.add_ground_plane()
 
         self.graph = None
         self.model = franka.finalize()
@@ -1434,6 +1444,7 @@ class Example:
             dis_compliance=1e-8,
             variable_dis_compliance=1e-8,
             bending_compliance=1e-3,
+            alignment_compliance=1e-6,
             damping=0.3,
             canvas_resolution=256,
             canvas_min_x=min_x,
@@ -1543,7 +1554,8 @@ class Example:
         else:
             displacement = np.zeros(3, dtype=np.float64)
 
-        if np.linalg.norm(displacement) > 0.5:
+        if self.first_time:
+            self.first_time = False
             return
 
         self._prev_brush_root_pos = current_pos.copy()

@@ -38,3 +38,13 @@ class BendingConstraint:
         self.point_c = point_c  # 第二个端点
         self.rest_distance = rest_distance  # a到c的直线距离
 
+class AlignmentConstraint:
+    """对齐约束 - 使非固定粒子趋向于两固定粒子构成的直线
+    """
+    def __init__(self, point_fixed_start, point_fixed_end, point_free, rest_ratio):
+        self.point_fixed_start = point_fixed_start
+        self.point_fixed_end = point_fixed_end
+        self.point_free = point_free
+        self.rest_ratio = rest_ratio # 初始状态下, free点到fixed_start点的距离比例 (离fixed_start的距离 / |start-end|)
+
+

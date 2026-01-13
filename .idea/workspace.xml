@@ -194,7 +194,7 @@
       <workItem from="1768163657337" duration="7586000" />
       <workItem from="1768173738233" duration="913000" />
       <workItem from="1768209252555" duration="24681000" />
-      <workItem from="1768282248090" duration="11394000" />
+      <workItem from="1768282248090" duration="15986000" />
     </task>
     <task id="LOCAL-00001" summary="修正效果">
       <option name="closed" value="true" />
@@ -219,7 +219,7 @@
       <breakpoints>
         <line-breakpoint enabled="true" suspend="THREAD" type="python-line">
           <url>file://$PROJECT_DIR$/src/simulation/example_ik_brush_trajectory.py</url>
-          <line>1881</line>
+          <line>1893</line>
           <option name="timeStamp" value="8" />
         </line-breakpoint>
         <line-breakpoint enabled="true" suspend="THREAD" type="python-line">
@@ -239,22 +239,22 @@
         </line-breakpoint>
         <line-breakpoint enabled="true" suspend="THREAD" type="python-line">
           <url>file://$PROJECT_DIR$/src/simulation/example_ik_brush_trajectory.py</url>
-          <line>1581</line>
+          <line>1593</line>
           <option name="timeStamp" value="57" />
         </line-breakpoint>
         <line-breakpoint enabled="true" suspend="THREAD" type="python-line">
           <url>file://$PROJECT_DIR$/src/simulation/example_ik_brush_trajectory.py</url>
-          <line>1854</line>
+          <line>1866</line>
           <option name="timeStamp" value="58" />
         </line-breakpoint>
         <line-breakpoint enabled="true" suspend="THREAD" type="python-line">
           <url>file://$PROJECT_DIR$/src/simulation/example_ik_brush_trajectory.py</url>
-          <line>1545</line>
+          <line>1556</line>
           <option name="timeStamp" value="59" />
         </line-breakpoint>
         <line-breakpoint enabled="true" suspend="THREAD" type="python-line">
           <url>file://$PROJECT_DIR$/src/simulation/example_ik_brush_trajectory.py</url>
-          <line>1485</line>
+          <line>1496</line>
           <option name="timeStamp" value="60" />
         </line-breakpoint>
       </breakpoints>
@@ -268,7 +268,7 @@
     <SUITE FILE_PATH="coverage/predict_traj$Doctests__newton_brush_simulator__.coverage" NAME="Doctests (newton_brush_simulator 内) 覆盖结果" MODIFIED="1768163786887" SOURCE_PROVIDER="com.intellij.coverage.DefaultCoverageFileProvider" RUNNER="coverage.py" COVERAGE_BY_TEST_ENABLED="false" COVERAGE_TRACING_ENABLED="false" WORKING_DIRECTORY="$PROJECT_DIR$/src/simulation" />
     <SUITE FILE_PATH="coverage/predict_traj$brush_width_calibration.coverage" NAME="brush_width_calibration 覆盖结果" MODIFIED="1768030548077" SOURCE_PROVIDER="com.intellij.coverage.DefaultCoverageFileProvider" RUNNER="coverage.py" COVERAGE_BY_TEST_ENABLED="false" COVERAGE_TRACING_ENABLED="false" WORKING_DIRECTORY="$PROJECT_DIR$/src/simulation" />
     <SUITE FILE_PATH="coverage/predict_traj$acc_video.coverage" NAME="acc_video 覆盖结果" MODIFIED="1767111873256" SOURCE_PROVIDER="com.intellij.coverage.DefaultCoverageFileProvider" RUNNER="coverage.py" COVERAGE_BY_TEST_ENABLED="false" COVERAGE_TRACING_ENABLED="false" WORKING_DIRECTORY="$PROJECT_DIR$/utils" />
-    <SUITE FILE_PATH="coverage/predict_traj$example_ik_brush_trajectory.coverage" NAME="example_ik_brush_trajectory 覆盖结果" MODIFIED="1768301019569" SOURCE_PROVIDER="com.intellij.coverage.DefaultCoverageFileProvider" RUNNER="coverage.py" COVERAGE_BY_TEST_ENABLED="false" COVERAGE_TRACING_ENABLED="false" WORKING_DIRECTORY="$PROJECT_DIR$/src/simulation" />
+    <SUITE FILE_PATH="coverage/predict_traj$example_ik_brush_trajectory.coverage" NAME="example_ik_brush_trajectory 覆盖结果" MODIFIED="1768307685825" SOURCE_PROVIDER="com.intellij.coverage.DefaultCoverageFileProvider" RUNNER="coverage.py" COVERAGE_BY_TEST_ENABLED="false" COVERAGE_TRACING_ENABLED="false" WORKING_DIRECTORY="$PROJECT_DIR$/src/simulation" />
     <SUITE FILE_PATH="coverage/predict_traj$check_pt.coverage" NAME="check_pt 覆盖结果" MODIFIED="1768300810648" SOURCE_PROVIDER="com.intellij.coverage.DefaultCoverageFileProvider" RUNNER="coverage.py" COVERAGE_BY_TEST_ENABLED="false" COVERAGE_TRACING_ENABLED="false" WORKING_DIRECTORY="$PROJECT_DIR$/utils" />
     <SUITE FILE_PATH="coverage/predict_traj$test.coverage" NAME="test 覆盖结果" MODIFIED="1768162541116" SOURCE_PROVIDER="com.intellij.coverage.DefaultCoverageFileProvider" RUNNER="coverage.py" COVERAGE_BY_TEST_ENABLED="false" COVERAGE_TRACING_ENABLED="false" WORKING_DIRECTORY="$PROJECT_DIR$/utils" />
   </component>

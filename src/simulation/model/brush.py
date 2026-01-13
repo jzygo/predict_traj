@@ -2,7 +2,7 @@ from random import random
 
 import torch
 
-from simulation.model.constraints import DistanceConstraint, FixedPointConstraint, AngleConstraint, VariableDistanceConstraint, BendingConstraint
+from simulation.model.constraints import DistanceConstraint, FixedPointConstraint, AngleConstraint, VariableDistanceConstraint, BendingConstraint, AlignmentConstraint
 
 
 def rotation_matrix_from_vectors(vec1, vec2):
@@ -155,10 +155,26 @@ class Brush:
                         self.root_position + torch.tensor([x, y, 0], dtype=torch.float64),
                         self.tangent_vector)
             hair.gen_particles(self.max_particles_per_hair)
+            fixed_particles = []
             for particle in hair.particles:
                 dis = torch.norm(particle.position - hair.root_position).item()
                 if dis < 1 / 10 * self.max_length:
                     self.constraints.append(FixedPointConstraint(particle))
+                    fixed_particles.append(particle)
+            
+            if len(fixed_particles) >= 2:
+                p_start = fixed_particles[0]
+                p_end = fixed_particles[-1]
+                dist_start_end = torch.norm(p_end.position - p_start.position).item() + 1e-6
+                
+                # Identify non-fixed particles that follow the fixed ones
+                # Assuming hair.particles is ordered from root to tip
+                start_idx = hair.particles.index(p_end) + 1
+                for k in range(start_idx, len(hair.particles)):
+                     dist_start_free = torch.norm(hair.particles[k].position - p_start.position).item()
+                     ratio = dist_start_free / dist_start_end
+                     self.constraints.append(AlignmentConstraint(p_start, p_end, hair.particles[k], ratio))
+
             self.hairs.append(hair)
             hair.gen_constraints()
             self.particles.extend(hair.particles)

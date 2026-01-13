@@ -15,7 +15,7 @@ import multiprocessing as mp
 from config import BRUSH_UP_POSITION, MAX_GRAVITY
 from simulation.model.brush import Brush
 from simulation.model.constraints import VariableDistanceConstraint, FixedPointConstraint, DistanceConstraint, \
-    BendingConstraint
+    BendingConstraint, AlignmentConstraint
 
 # 使用无界面后端，便于子进程并行渲染
 matplotlib.use("Agg")
@@ -628,6 +628,96 @@ import warp as wp
 
 
 @wp.kernel
+def solve_alignment_constraints(
+        positions: wp.array(dtype=wp.vec3d, ndim=3),
+        time_id: int,
+        inv_masses: wp.array(dtype=wp.float64, ndim=2),
+        constraint_indices: wp.array(dtype=wp.vec3i),
+        rest_ratios: wp.array(dtype=wp.float64),
+        compliances: wp.array(dtype=wp.float64),
+        lagrange_multipliers: wp.array(dtype=wp.float64),
+        deltas_x: wp.array(dtype=wp.float64, ndim=2),
+        deltas_y: wp.array(dtype=wp.float64, ndim=2),
+        deltas_z: wp.array(dtype=wp.float64, ndim=2),
+        dt: wp.float64,
+        num_constraints: int
+):
+    batch_id, tid = wp.tid()
+    if tid >= num_constraints:
+        return
+
+    idx = constraint_indices[tid]
+    i, j, k = idx[0], idx[1], idx[2]
+
+    # Get positions: i, j are fixed (start, end), k is free
+    p_start = positions[batch_id, time_id, i]
+    p_end = positions[batch_id, time_id, j]
+    p_free = positions[batch_id, time_id, k]
+
+    # Axis vector from start to end
+    axis = p_end - p_start
+    axis_sq = wp.dot(axis, axis)
+    eps = wp.float64(1e-12)
+
+    if axis_sq < eps:
+        return
+
+    # New projection definition: Use stored ratio to determine target position along the line
+    ratio = rest_ratios[tid]
+    # To handle potential scaling of the brush (though fixed points distance implies scale), we can use the ratio.
+    # If the brush scale changes, the distance between p_start and p_end changes, and ratio * (p_end - p_start) scales accordingly.
+    # However, if we stored exact distance `rest_distance` from start, we would need to normalize by current axis length or just add dist * dir.
+    # Using ratio is safer if the fixed part stretches (soft constraints), but here it's "fixed" relative to brush, so it's consistent.
+    # But wait, user asked: "新的投影位置定义是沿着两个固定点形成的直线行进同样的距离"
+    # "同样的距离" implies absolute distance, not ratio.
+    # BUT if the brush rotates/translates, the distance is preserved.
+    # Let's interpret "Same distance" as "Same distance from start point as it was initially".
+    # Since alignment constraint is usually for "straightness", using the ratio * current_axis_vector is equivalent if axis length is constant.
+    # And correct if axis length changes (stretches).
+    # If I used absolute distance: target = p_start + normalize(axis) * initial_dist.
+    # If I use ratio: target = p_start + (p_end - p_start) * ratio. (where ratio = initial_dist / initial_axis_len).
+    # If p_start and p_end are "Fixed" particles (relative to brush frame), their distance should be constant (rigid).
+    # So both are effectively the same.
+    # The ratio implementation is slightly cheaper (no sqrt for normalize if not needed, but wait, ratio * vector handles direction and length).
+    # Ratio approach: target = p_start + axis * ratio.
+    
+    # Calculate target position
+    p_proj = p_start + axis * ratio
+
+    # Distance vector from projection to free point
+    diff = p_free - p_proj
+    dist = wp.length(diff)
+
+    if dist < eps:
+        return
+
+    # Direction of correction (pulling free particle towards line)
+    n = diff / dist
+
+    w_free = inv_masses[batch_id, k]
+    # For fixed particles, inv_mass is zero, so we only consider w_free
+    w_sum = w_free
+
+    if w_sum < eps:
+        return
+
+    alpha = compliances[tid] / (dt * dt)
+    denom = w_sum + alpha
+
+    # Delta lambda
+    delta_lambda = -(dist + alpha * lagrange_multipliers[tid]) / denom
+    lagrange_multipliers[tid] = lagrange_multipliers[tid] + delta_lambda
+
+    # Correction
+    correction = delta_lambda * n * w_free
+    
+    # We only update the free particle
+    wp.atomic_add(deltas_x, batch_id, k, correction[0])
+    wp.atomic_add(deltas_y, batch_id, k, correction[1])
+    wp.atomic_add(deltas_z, batch_id, k, correction[2])
+
+
+@wp.kernel
 def solve_bending_constraints(
         positions: wp.array(dtype=wp.vec3d, ndim=3),
         time_id: int,
@@ -919,6 +1009,7 @@ class XPBDSimulator:
                  splat_sigma_px: float = 1.0,  # 高斯核标准差（以像素为单位）
                  splat_radius_px: int = 1,  # 溅射半径（像素，2->5x5 邻域）
                  fixed_stiffness: float = 0.6,  # 软固定约束的收敛强度 (0,1]，越大越“硬”
+                 alignment_compliance: float = 1e-4,  # 对齐约束compliance
                  canvas_min_x: float = 0.0,
                  canvas_max_x: float = 1.0,
                  canvas_min_y: float = 0.0,
@@ -938,6 +1029,7 @@ class XPBDSimulator:
         self.dis_compliance = dis_compliance
         self.variable_dis_compliance = variable_dis_compliance
         self.bending_compliance = bending_compliance
+        self.alignment_compliance = alignment_compliance
         self.damping = damping
         self.restitution = restitution
         self.friction = friction
@@ -1007,6 +1099,12 @@ class XPBDSimulator:
         self.bending_rest_distances = None
         self.bending_compliances = None
         self.bending_lambdas = None
+
+        # Alignment constraint arrays
+        self.alignment_indices = None
+        self.alignment_rest_ratios = None
+        self.alignment_compliances = None
+        self.alignment_lambdas = None
 
         self.fixed_indices = None
         self.fixed_positions = None
@@ -1152,6 +1250,7 @@ class XPBDSimulator:
         distance_data = []
         variable_distance_data = []
         bending_data = []
+        alignment_data = []
         fixed_data = []
 
         for constraint in constraints:
@@ -1185,6 +1284,14 @@ class XPBDSimulator:
                 rest_dist = constraint.rest_distance
                 compliance = self.bending_compliance
                 bending_data.append((i, j, k, rest_dist, compliance))
+
+            elif isinstance(constraint, AlignmentConstraint):
+                i = constraint.point_fixed_start.particle_id
+                j = constraint.point_fixed_end.particle_id
+                k = constraint.point_free.particle_id
+                ratio = constraint.rest_ratio
+                compliance = self.alignment_compliance
+                alignment_data.append((i, j, k, ratio, compliance))
 
         # Create distance constraint arrays using torch
         if distance_data:
@@ -1232,6 +1339,20 @@ class XPBDSimulator:
             self.bending_compliances = wp.from_torch(bending_compliances, dtype=wp.float64)
             self.bending_lambdas = wp.from_torch(bending_lambdas, dtype=wp.float64)
             self.num_bending_constraints = num_bending
+
+        # Create alignment constraint arrays using torch
+        if alignment_data:
+            num_ali = len(alignment_data)
+            ali_indices = torch.tensor([(d[0], d[1], d[2]) for d in alignment_data], dtype=torch.int32).to(self.device)
+            ali_ratios = torch.tensor([d[3] for d in alignment_data], dtype=torch.float64).to(self.device)
+            ali_compliances = torch.tensor([d[4] for d in alignment_data], dtype=torch.float64).to(self.device)
+            ali_lambdas = torch.zeros(num_ali, dtype=torch.float64).to(self.device)
+
+            self.alignment_indices = wp.from_torch(ali_indices, dtype=wp.vec3i)
+            self.alignment_rest_ratios = wp.from_torch(ali_ratios, dtype=wp.float64)
+            self.alignment_compliances = wp.from_torch(ali_compliances, dtype=wp.float64)
+            self.alignment_lambdas = wp.from_torch(ali_lambdas, dtype=wp.float64)
+            self.num_alignment_constraints = num_ali
 
         # Create fixed constraint arrays using torch
         if fixed_data:
@@ -1421,23 +1542,45 @@ class XPBDSimulator:
             #     )
 
             # Solve bending constraints for hair stiffness
-            if self.bending_indices is not None and self.num_bending_constraints > 0:
+            # if self.bending_indices is not None and self.num_bending_constraints > 0:
+            #     wp.launch(
+            #         solve_bending_constraints,
+            #         dim=(self.batch_size, self.num_bending_constraints),
+            #         inputs=[
+            #             self.positions,
+            #             time_step,
+            #             self.inv_masses,
+            #             self.bending_indices,
+            #             self.bending_rest_distances,
+            #             self.bending_compliances,
+            #             self.bending_lambdas,
+            #             self._delta_x,
+            #             self._delta_y,
+            #             self._delta_z,
+            #             self.sub_dt,
+            #             self.num_bending_constraints
+            #         ],
+            #         device=self.device
+            #     )
+
+            # Solve alignment constraints
+            if self.alignment_indices is not None and self.num_alignment_constraints > 0:
                 wp.launch(
-                    solve_bending_constraints,
-                    dim=(self.batch_size, self.num_bending_constraints),
+                    solve_alignment_constraints,
+                    dim=(self.batch_size, self.num_alignment_constraints),
                     inputs=[
                         self.positions,
                         time_step,
                         self.inv_masses,
-                        self.bending_indices,
-                        self.bending_rest_distances,
-                        self.bending_compliances,
-                        self.bending_lambdas,
+                        self.alignment_indices,
+                        self.alignment_rest_ratios,
+                        self.alignment_compliances,
+                        self.alignment_lambdas,
                         self._delta_x,
                         self._delta_y,
                         self._delta_z,
                         self.sub_dt,
-                        self.num_bending_constraints
+                        self.num_alignment_constraints
                     ],
                     device=self.device
                 )
