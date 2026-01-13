@@ -143,7 +143,7 @@ def load_font_data(data_root: str) -> tuple:
     common_keys = sorted(list(set(strokes_data.keys()) & set(images_data.keys())))
     import random
     char_key = random.choice(common_keys)
-    char_key = "下载 (1)"
+    char_key = "下载 (3)"
     # char_key = "debug"
     # 解码图像
     img_bytes = images_data[char_key]
@@ -718,8 +718,8 @@ class Example:
         # 渲染: render_hairs=100, render_particles_per_hair=10 (共1000粒子)
         # ------------------------------------------------------------------
         self.render_downsample_enabled = True  # 是否启用渲染降采样
-        self.render_hairs = 100  # 渲染时使用的毛发数量
-        self.render_particles_per_hair = 30  # 渲染时每根毛发的粒子数量
+        self.render_hairs = 50  # 渲染时使用的毛发数量
+        self.render_particles_per_hair = 20  # 渲染时每根毛发的粒子数量
         self._render_hair_indices = None  # 缓存：用于渲染的毛发索引
         self._render_particle_indices = None  # 缓存：用于渲染的粒子索引（相对于每根毛发）
         self._render_global_indices = None  # 缓存：用于渲染的全局粒子索引（预计算，避免每帧循环）
@@ -764,17 +764,17 @@ class Example:
         # ------------------------------------------------------------------
         # IK 权重/迭代参数
         # ------------------------------------------------------------------
-        self.pos_weight = 20.0
-        self.rot_weight = 5.0
-        self.joint_limit_weight = 1.0
+        self.pos_weight = 4.0
+        self.rot_weight = 1.0
+        self.joint_limit_weight = 10.0
 
         # ------------------------------------------------------------------
         # Build Franka robot + ground
         # ------------------------------------------------------------------
         franka = newton.ModelBuilder()
         franka.add_urdf(
-            # newton.utils.download_asset("franka_emika_panda") / "urdf/fr3_franka_hand.urdf",
-            Path("/data1/jizy/newton-assets/franka_emika_panda") / "urdf/fr3_franka_hand.urdf",
+            newton.utils.download_asset("franka_emika_panda") / "urdf/fr3_franka_hand.urdf",
+            # Path("/data1/jizy/newton-assets/franka_emika_panda") / "urdf/fr3_franka_hand.urdf",
             floating=False,
         )
         franka.add_ground_plane()
@@ -782,6 +782,14 @@ class Example:
         self.graph = None
         self.model = franka.finalize()
         self.viewer.set_model(self.model)
+
+        # 设置机械臂舒适姿态 (Franka Ready Pose)
+        if self.model.joint_coord_count >= 7:
+            init_q = np.zeros(self.model.joint_coord_count, dtype=np.float32)
+            comfortable_pose = [0.0, -0.785, 0.0, -2.356, 0.0, 1.571, 0.785]
+            for i in range(min(len(comfortable_pose), self.model.joint_coord_count)):
+                init_q[i] = comfortable_pose[i]
+            self.model.joint_q = wp.array(init_q, dtype=wp.float32, device=self.viewer.device)
 
         # States
         self.state = self.model.state()
@@ -1187,9 +1195,19 @@ class Example:
             # 这是额外的平滑层，使关节变化更加平缓
             smoothed_q = self._prev_joint_q * (1 - self.joint_smooth_alpha) + solved_q * self.joint_smooth_alpha
 
+            # 第四步：强制关节限位截断
+            lower_limits = self.model.joint_limit_lower.numpy()
+            upper_limits = self.model.joint_limit_upper.numpy()
+            smoothed_q = np.clip(smoothed_q, lower_limits, upper_limits)
+
             self._prev_joint_q = smoothed_q.copy()
             self.model.joint_q = wp.array(smoothed_q, dtype=wp.float32, device=self.viewer.device)
         else:
+            # 初始帧也要截断
+            lower_limits = self.model.joint_limit_lower.numpy()
+            upper_limits = self.model.joint_limit_upper.numpy()
+            solved_q = np.clip(solved_q, lower_limits, upper_limits)
+
             self._prev_joint_q = solved_q.copy()
             self._prev_joint_velocity = np.zeros_like(solved_q)
             self.model.joint_q = wp.array(solved_q, dtype=wp.float32, device=self.viewer.device)
@@ -1525,7 +1543,7 @@ class Example:
         else:
             displacement = np.zeros(3, dtype=np.float64)
 
-        if np.linalg.norm(displacement) > 0.1:
+        if np.linalg.norm(displacement) > 0.5:
             return
 
         self._prev_brush_root_pos = current_pos.copy()
