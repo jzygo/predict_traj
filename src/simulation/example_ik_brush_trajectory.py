@@ -773,8 +773,8 @@ class Example:
         # ------------------------------------------------------------------
         franka = newton.ModelBuilder()
         franka.add_urdf(
-            newton.utils.download_asset("franka_emika_panda") / "urdf/fr3_franka_hand.urdf",
-            # Path("/data1/jizy/newton-assets/franka_emika_panda") / "urdf/fr3_franka_hand.urdf",
+            # newton.utils.download_asset("franka_emika_panda") / "urdf/fr3_franka_hand.urdf",
+            Path("/data1/jizy/newton-assets/franka_emika_panda") / "urdf/fr3_franka_hand.urdf",
             floating=False,
         )
         franka.add_ground_plane()
@@ -1415,7 +1415,7 @@ class Example:
             gravity=torch.tensor([0.0, 0.0, -MAX_GRAVITY], dtype=torch.float64),
             dis_compliance=1e-8,
             variable_dis_compliance=1e-8,
-            bending_compliance=1e-6,
+            bending_compliance=1e-3,
             damping=0.3,
             canvas_resolution=256,
             canvas_min_x=min_x,

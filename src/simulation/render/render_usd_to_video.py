@@ -3,6 +3,7 @@ import sys
 import os
 import math
 import argparse
+import subprocess
 
 # --- 全局配置 ---
 OUTPUT_DIR_BASE = "/home/jizy/project/video_tokenizer/src/simulation/render/output_frames"
@@ -29,6 +30,8 @@ def get_args():
     
     parser.add_argument("--probe", action="store_true", help="Only detect frame range and exit")
     
+    parser.add_argument("--use_ffmpeg", action="store_true", help="Render images first then combine with ffmpeg")
+
     return parser.parse_args(argv)
 
 def auto_detect_frame_range():
@@ -98,48 +101,69 @@ def setup_scene(args):
         sys.exit(1)
 
     # --- 设置特定对象的材质颜色 ---
-    def assign_color(obj_name, color_rgb):
-        """Helper to assign generic material color to an object by name"""
-        # 1. 查找所有匹配名称的对象 (包含 obj_name 的 MESH 对象)
-        targets = []
-        for obj in bpy.data.objects:
-            if obj.type == 'MESH' and (obj_name in obj.name):
-                targets.append(obj)
-        
-        if not targets:
-            print(f"Warning: No mesh objects found matching '{obj_name}'")
-            return
-
-        # 2. 创建或获取材质
-        mat_name = f"Mat_{obj_name}"
-        mat = bpy.data.materials.get(mat_name)
+    def get_or_create_material(name, color_rgb, roughness=0.5):
+        """获取或创建指定颜色的材质"""
+        mat = bpy.data.materials.get(name)
         if not mat:
-            mat = bpy.data.materials.new(name=mat_name)
+            mat = bpy.data.materials.new(name=name)
             mat.use_nodes = True
             bsdf = mat.node_tree.nodes.get("Principled BSDF")
             if bsdf:
                 bsdf.inputs['Base Color'].default_value = (*color_rgb, 1.0)
-                # 黑色物体 (如墨水) 可以调整粗糙度
-                if color_rgb == (0, 0, 0):
-                    bsdf.inputs['Roughness'].default_value = 0.8
-                    bsdf.inputs['Specular IOR Level'].default_value = 0.2
+                bsdf.inputs['Roughness'].default_value = roughness
+                # 针对黑色墨水增加一点光泽控制
+                if color_rgb == (0.0, 0.0, 0.0):
+                    try:
+                        bsdf.inputs['Specular IOR Level'].default_value = 0.2
+                    except:
+                        pass 
+        return mat
 
-        # 3. 强制应用材质
-        for obj in targets:
-            # 清空现有材质槽，确保只使用我们的新材质
-            if obj.data.materials:
-                obj.data.materials.clear()
+    def apply_material_recursive(root_name, material):
+        """
+        查找名为 root_name 的物体，并将 material 应用于它及其所有子孙物体
+        """
+        root_obj = bpy.data.objects.get(root_name)
+        
+        if not root_obj:
+            print(f"Warning: Root object '{root_name}' not found in scene.")
+            return
+
+        print(f"--- Applying material '{material.name}' to hierarchy under '{root_name}' ---")
+        
+        # 递归函数遍历子节点
+        def _recursive_apply(obj):
+            # 如果是网格物体，应用材质
+            if obj.type == 'MESH':
+                if obj.data.materials:
+                    obj.data.materials.clear()
+                obj.data.materials.append(material)
+                # print(f"  -> Applied to {obj.name}") # 调试用，防止输出太多可注释掉
             
-            obj.data.materials.append(mat)
-            print(f"Success: Assigned material {color_rgb} to '{obj.name}'")
+            # 继续遍历子物体
+            for child in obj.children:
+                _recursive_apply(child)
 
-    # Apply user requested colors
-    for i in range(1, 1000):
-        assign_color(f"instance_{i}", (0.0, 0.0, 0.0))       # Black
-    assign_color(f"instance_0.003", (0.0, 0.0, 0.0))       # Black
-    assign_color("instance_0.001", (0.6, 0.4, 0.2)) # Brownish
+        # 开始递归
+        _recursive_apply(root_obj)
+
+    # 1. 定义材质
+    # 黑色 (用于 brush_particles)
+    mat_black = get_or_create_material("Mat_Black", (0.0, 0.0, 0.0), roughness=0.2)
+    # 棕色 (用于 stick)
+    mat_brown = get_or_create_material("Mat_Brown", (0.6, 0.4, 0.2), roughness=0.6)
+
+    # 2. 应用材质到指定层级
+    # 将 brush_particles_instance 下所有物体设为黑色
+    apply_material_recursive("brush_particles_instance", mat_black)
+    
+    # 将 stick_instance 下所有物体设为棕色
+    apply_material_recursive("stick_instance", mat_brown)
+
+    # ----------------------------------------
 
     scene = bpy.context.scene
+
     
     # --- 帧范围设定逻辑 ---
     detected_start, detected_end = auto_detect_frame_range()
@@ -209,6 +233,24 @@ def setup_scene(args):
     if not has_light:
         bpy.ops.object.light_add(type='SUN', location=(5, 5, 10))
         bpy.context.active_object.data.energy = 3.0
+    
+    output_path = os.path.join(bpy.path.abspath("//"), "hierarchy.txt")
+
+    def write_obj_hierarchy(obj, file, level=0):
+        indent = "    " * level
+        file.write(f"{indent}- {obj.name} [{obj.type}]\n")
+        
+        # 递归遍历子物体
+        for child in obj.children:
+            write_obj_hierarchy(child, file, level + 1)
+
+    with open(output_path, "w", encoding="utf-8") as f:
+        # 找出所有没有父级的物体作为根节点开始遍历
+        root_objects = [o for o in bpy.context.scene.objects if o.parent is None]
+        for root in root_objects:
+            write_obj_hierarchy(root, f)
+
+    print("✅ 已导出层级结构树")
 
     # 4. GPU 设置 (Eevee 默认使用 GPU，无需额外配置)
     # Eevee 自动使用 GPU 加速，比 Cycles 快很多
@@ -225,7 +267,8 @@ def setup_scene(args):
         cam_data = bpy.data.cameras.new("Camera")
         cam_obj = bpy.data.objects.new("Camera", cam_data)
         scene.collection.objects.link(cam_obj)
-        cam_obj.location = (2.8342, 1.9493, 2.3283)
+        k = 0.7
+        cam_obj.location = (2.8342 * k, 1.9493 * k, 2.5283 * k)
         cam_obj.rotation_euler = (math.radians(54.959), 0, math.radians(125.89))
         scene.camera = cam_obj
 
@@ -235,28 +278,72 @@ def setup_scene(args):
     
     # 设置完整的文件输出路径 (包括文件名和后缀)
     video_filename = args.video_name if args.video_name else "output.mp4"
-    scene.render.filepath = os.path.join(OUTPUT_DIR_BASE, video_filename)
     
-    # 设置为 FFmpeg 视频输出
-    scene.render.image_settings.file_format = 'FFMPEG'
-    
-    # 设置视频编码参数
-    scene.render.ffmpeg.format = 'MPEG4'        # 容器格式 (mp4)
-    scene.render.ffmpeg.codec = 'H264'          # 视频编码 (H.264)
-    scene.render.ffmpeg.constant_rate_factor = 'MEDIUM'  # 质量控制 (HIGH, MEDIUM, LOW)
-    scene.render.ffmpeg.gopsize = 18            # 关键帧间隔
-    
-    # 如果不需要音频，可以禁用
-    scene.render.ffmpeg.audio_codec = 'NONE'
+    if args.use_ffmpeg:
+        # 模式 B: 先渲染图片序列
+        frames_dir = os.path.join(OUTPUT_DIR_BASE, "temp_frames")
+        if not os.path.exists(frames_dir):
+            os.makedirs(frames_dir, exist_ok=True)
+            
+        # Blender 会自动追加帧号 (e.g., frame_0001.png)
+        scene.render.filepath = os.path.join(frames_dir, "frame_")
+        scene.render.image_settings.file_format = 'PNG'
+        print(f"--- Output Configured: Image Sequence at {scene.render.filepath} ---")
+    else:
+        scene.render.filepath = os.path.join(OUTPUT_DIR_BASE, video_filename)
+        
+        # 设置为 FFmpeg 视频输出
+        scene.render.image_settings.file_format = 'FFMPEG'
+        
+        # 设置视频编码参数
+        scene.render.ffmpeg.format = 'MPEG4'        # 容器格式 (mp4)
+        scene.render.ffmpeg.codec = 'H264'          # 视频编码 (H.264)
+        scene.render.ffmpeg.constant_rate_factor = 'MEDIUM'  # 质量控制 (HIGH, MEDIUM, LOW)
+        scene.render.ffmpeg.gopsize = 18            # 关键帧间隔
+        
+        # 如果不需要音频，可以禁用
+        scene.render.ffmpeg.audio_codec = 'NONE'
 
-    print(f"--- Output Configured: {scene.render.filepath} (H.264 MP4) ---")
+        print(f"--- Output Configured: {scene.render.filepath} (H.264 MP4) ---")
 
     return True
 
-def render():
+def render(args):
     """执行渲染"""
     # animation=True 会自动渲染整个范围并编码为视频
     bpy.ops.render.render(animation=True)
+
+    if args.use_ffmpeg:
+        print("--- combining frames with ffmpeg ---")
+        video_filename = args.video_name if args.video_name else "output.mp4"
+        output_video_path = os.path.join(OUTPUT_DIR_BASE, video_filename)
+        frames_dir = os.path.join(OUTPUT_DIR_BASE, "temp_frames")
+        
+        # 输入模式：frame_XXXX.png (%04d 是 Blender 默认填充)
+        input_pattern = os.path.join(frames_dir, "frame_%04d.png")
+        
+        # 获取帧率
+        fps = bpy.context.scene.render.fps
+        start_frame = bpy.context.scene.frame_start
+
+        # 构建 FFmpeg 命令
+        # -y: 覆盖输出
+        # -start_number: 序列起始帧
+        command = [
+            "ffmpeg", "-y",
+            "-framerate", str(fps),
+            "-start_number", str(start_frame),
+            "-i", input_pattern,
+            "-c:v", "libx264",
+            "-pix_fmt", "yuv420p",
+            output_video_path
+        ]
+        
+        try:
+            subprocess.check_call(command)
+            print(f"Success: Video saved to {output_video_path}")
+        except Exception as e:
+            print(f"Error running ffmpeg: {e}")
 
 if __name__ == "__main__":
     args = get_args()
@@ -266,4 +353,4 @@ if __name__ == "__main__":
     
     # 2. 直接渲染出视频
     if should_render:
-        render()
+        render(args)
