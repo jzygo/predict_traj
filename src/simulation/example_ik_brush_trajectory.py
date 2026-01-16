@@ -7,6 +7,7 @@ import os
 import io
 import pickle
 import sys
+import time
 
 
 def setup_best_gpu():
@@ -61,8 +62,7 @@ if str(PROJECT_ROOT) not in sys.path:
 
 # 导入毛笔物理仿真模块
 from simulation.model.brush import Brush
-from simulation.xpbd_warp_diff import XPBDSimulator, identity_quaternion
-# from simulation.newton_brush_simulator import NewtonBrushSimulatorCompat as XPBDSimulator, identity_quaternion
+from simulation.xpbd_warp_diff import XPBDSimulator
 from simulation.config import BRUSH_UP_POSITION
 
 # 导入轨迹工具（用于弧长重采样）
@@ -161,8 +161,8 @@ def load_font_data(data_root: str) -> tuple:
     # for stroke in stroke_result:
     #     for i in range(len(stroke)):
     #         stroke[i][2] = stroke[i][2] / max_r * BRUSH_RADIUS
-    # return stroke_result, image, char_key
-    return [stroke_result[1], stroke_result[8]], image, char_key
+    return stroke_result, image, char_key
+    # return [stroke_result[1], stroke_result[8]], image, char_key
 
 
 def build_brush(root_position: torch.Tensor = None, tangent_vector: torch.Tensor = None, stick_length: float = 0.3) -> Brush:
@@ -186,7 +186,7 @@ def build_brush(root_position: torch.Tensor = None, tangent_vector: torch.Tensor
         radius=BRUSH_RADIUS,
         max_length=BRUSH_MAX_LENGTH,
         max_hairs=500,
-        max_particles_per_hair=30,
+        max_particles_per_hair=20,
         thickness=0.005,  # 毛发粗细
         root_position=root_position,
         tangent_vector=tangent_vector,  # 向下
@@ -515,6 +515,11 @@ class Example:
         self.viewer = viewer
 
         self.first_time = True
+        
+        # 性能统计
+        self.perf_frame_count = 0
+        self.perf_total_time = 0.0
+        self.perf_last_time = time.time()
 
         # ------------------------------------------------------------------
         # 命令行参数：坐标偏移量
@@ -670,7 +675,7 @@ class Example:
         self.is_preparing = False  # 笔画开始前的准备（姿态调整+下降）
         self.prepare_progress = 0.0  # 准备进度 [0, 1]
         self.prepare_speed = 0.01  # 准备阶段推进速度（越小越慢，可拉长调整时间）
-        self.points_per_frame = 0.1  # 每帧前进的点数（控制书写速度）; 越小越慢 (0.5=原速, 0.1=5倍慢)
+        self.points_per_frame = 0.5  # 每帧前进的点数（控制书写速度）; 越小越慢 (0.5=原速, 0.1=5倍慢)
         self.point_accumulator = 0.0  # 点累加器（用于非整数速度）
 
         # 存储当前目标位置（用于抬笔过渡）
@@ -711,7 +716,7 @@ class Example:
         # ------------------------------------------------------------------
         self.brush_length = 0.08  # 毛笔长度 8cm
         self._prev_brush_root_pos = None  # 上一帧毛笔根部位置
-        self.brush_sim_substeps = 1  # 物理仿真子步数
+        self.brush_sim_substeps = 10  # 物理仿真子步数
         self.brush_particles_positions = None  # 毛笔粒子位置（用于渲染）
 
         # ------------------------------------------------------------------
@@ -721,7 +726,7 @@ class Example:
         # ------------------------------------------------------------------
         self.render_downsample_enabled = True  # 是否启用渲染降采样
         self.render_hairs = 50  # 渲染时使用的毛发数量
-        self.render_particles_per_hair = 20  # 渲染时每根毛发的粒子数量
+        self.render_particles_per_hair = 30  # 渲染时每根毛发的粒子数量
         self._render_hair_indices = None  # 缓存：用于渲染的毛发索引
         self._render_particle_indices = None  # 缓存：用于渲染的粒子索引（相对于每根毛发）
         self._render_global_indices = None  # 缓存：用于渲染的全局粒子索引（预计算，避免每帧循环）
@@ -1443,8 +1448,8 @@ class Example:
             gravity=torch.tensor([0.0, 0.0, -MAX_GRAVITY], dtype=torch.float64),
             dis_compliance=1e-8,
             variable_dis_compliance=1e-8,
-            bending_compliance=1e-3,
-            alignment_compliance=1e-6,
+            bending_compliance=1e-5,
+            alignment_compliance_range=(1e-4, 1e-5),
             damping=0.3,
             canvas_resolution=256,
             canvas_min_x=min_x,
@@ -1460,12 +1465,12 @@ class Example:
         initial_displacements = torch.zeros((1, num_sim_steps, 3), dtype=torch.float64)
 
         # 初始化旋转序列（如果启用旋转仿真）
-        if self._brush_use_rotation:
-            # 创建单位四元数序列 (w, x, y, z) 格式
-            initial_rotations = identity_quaternion((num_sim_steps,), dtype=torch.float64)
-            self.brush_simulator.load_displacements(initial_displacements[0], initial_rotations)
-        else:
-            self.brush_simulator.load_displacements(initial_displacements[0])
+        # if self._brush_use_rotation:
+        #     # 创建单位四元数序列 (w, x, y, z) 格式
+        #     initial_rotations = identity_quaternion((num_sim_steps,), dtype=torch.float64)
+        #     self.brush_simulator.load_displacements(initial_displacements[0], initial_rotations)
+        # else:
+        #     self.brush_simulator.load_displacements(initial_displacements[0])
 
         # 记录当前毛笔根部位置
         self._prev_brush_root_pos = np.array(initial_brush_root, dtype=np.float64)
@@ -1539,60 +1544,40 @@ class Example:
             return [0.4, 0.0, 0.5 + self.lift_height]
 
     def _update_brush_simulation(self):
-        """更新毛笔物理仿真 - 将毛笔根部与木棍端点对齐，并同步笔杆旋转"""
+        """更新毛笔物理仿真 - 直接使用当前笔杆的绝对位置和旋转来计算固定粒子位置"""
         if not self.brush_initialized or self.brush_simulator is None:
             return
-
-        # 获取当前木棍端点位置
-        stick_tip_pos = self._get_stick_tip_position()
-        current_pos = np.array([float(stick_tip_pos[0]), float(stick_tip_pos[1]), float(stick_tip_pos[2])],
-                               dtype=np.float64)
-
-        # 计算位移（当前位置 - 上一帧位置）
-        if self._prev_brush_root_pos is not None:
-            displacement = current_pos - self._prev_brush_root_pos
-        else:
-            displacement = np.zeros(3, dtype=np.float64)
 
         if self.first_time:
             self.first_time = False
             return
 
-        self._prev_brush_root_pos = current_pos.copy()
+        # 获取当前木棍端点位置（作为毛笔根部位置）
+        stick_tip_pos = self._get_stick_tip_position()
+        current_pos = torch.tensor(
+            [float(stick_tip_pos[0]), float(stick_tip_pos[1]), float(stick_tip_pos[2])],
+            dtype=torch.float64
+        )
 
-        # 计算旋转增量（如果启用旋转仿真）
-        delta_rotation = None
-        if self._brush_use_rotation and self.brush_simulator.use_rotation:
-            current_rotation = self._get_stick_rotation()
-            if self._prev_brush_rotation is not None:
-                delta_rotation = self._compute_delta_rotation(self._prev_brush_rotation, current_rotation)
-            else:
-                # 第一帧使用单位四元数（无旋转）
-                delta_rotation = np.array([1.0, 0.0, 0.0, 0.0])  # (w, x, y, z)
-            self._prev_brush_rotation = current_rotation.copy()
+        # 获取当前笔杆的绝对旋转四元数
+        # _get_stick_rotation 返回 [x, y, z, w] 格式
+        current_rotation = self._get_stick_rotation()
+        # 转换为 (w, x, y, z) 格式，供仿真器使用
+        # 注意：stick_rotation 的指向和笔头指向相反，需要绕局部X轴旋转180度来取反方向
+        # 绕X轴旋转180度的四元数: (w=0, x=1, y=0, z=0)
+        # 四元数乘法: q_result = q_current * q_flip
+        x, y, z, w = current_rotation[0], current_rotation[1], current_rotation[2], current_rotation[3]
+        flipped_w = -x
+        flipped_x = w
+        flipped_y = z
+        flipped_z = -y
+        absolute_rotation = torch.tensor(
+            [flipped_w, flipped_x, flipped_y, flipped_z],
+            dtype=torch.float64
+        )
 
-        # 更新仿真器中的位移和旋转
-        if self.brush_sim_step < self.brush_simulator.num_steps - 1:
-            # 将位移转换为 warp 格式并应用
-            disp_tensor = torch.tensor(displacement, dtype=torch.float64).unsqueeze(0)
-
-            # 直接更新 displacement 数组中的当前步
-            # 注意：需要 clone 和 detach 来避免 in-place 操作错误
-            if self.brush_simulator.displacement is not None:
-                disp_wp = wp.to_torch(self.brush_simulator.displacement).clone().detach()
-                disp_wp[0, self.brush_sim_step] = disp_tensor
-                self.brush_simulator.displacement = wp.from_torch(disp_wp, dtype=wp.vec3d, requires_grad=True)
-
-            # 更新旋转序列（如果启用旋转仿真）
-            if delta_rotation is not None and self.brush_simulator.delta_rotation_seq is not None:
-                rot_tensor = torch.tensor(delta_rotation, dtype=torch.float64).unsqueeze(0)
-                rot_wp = wp.to_torch(self.brush_simulator.delta_rotation_seq).clone().detach()
-                rot_wp[0, self.brush_sim_step] = rot_tensor
-                self.brush_simulator.delta_rotation_seq = wp.from_torch(rot_wp, dtype=wp.vec4d, requires_grad=True)
-
-            # 执行一步仿真
-            self.brush_simulator.step(self.brush_sim_step, self.brush_sim_step + 1)
-            # self.brush_sim_step += 1
+        # 使用绝对变换执行一步仿真
+        self.brush_simulator.step_with_absolute_transform(current_pos, absolute_rotation)
 
         # 提取粒子位置用于渲染
         self._extract_brush_particles_for_rendering()
@@ -2037,7 +2022,7 @@ class Example:
                         record_stroke_r += f"{r_vals[j]:.4f}, "
                         circle = patches.Circle((xy[j, 0], xy[j, 1]), r_vals[j])
                         circle_patches.append(circle)
-                print(f"[Final] Stroke {i + 1} radii: {record_stroke_r}")
+                # print(f"[Final] Stroke {i + 1} radii: {record_stroke_r}")
 
                 if circle_patches:
                     # 使用 PatchCollection 提高性能
@@ -2084,6 +2069,15 @@ class Example:
         plt.close()
 
     def render(self):
+        # 计算每一帧的耗时
+        current_time = time.time()
+        dt_real = current_time - self.perf_last_time
+        self.perf_last_time = current_time
+
+        if dt_real < 1.0:  # 避免初始化或暂停导致的长时间
+            self.perf_total_time += dt_real
+            self.perf_frame_count += 1
+
         self.viewer.begin_frame(self.sim_time)
 
         newton.eval_fk(self.model, self.model.joint_q, self.model.joint_qd, self.state)
@@ -2173,7 +2167,9 @@ class Example:
                         min_z = np.min(self.brush_particles_positions[:, 2])
                         brush_info += f"  brush_min_z={min_z:.4f}"
 
+                avg_time = (self.perf_total_time / self.perf_frame_count) * 1000.0 if self.perf_frame_count > 0 else 0.0
                 print(f"[{status}] [{(self.sim_time / self.frame_dt):.2f} frames] {stroke_info}  err={err:.4f}m  "
+                      f"avg_dt={avg_time:.2f}ms  "
                       f"tilt_dir=({self._smoothed_direction[0]:.2f},{self._smoothed_direction[1]:.2f}){brush_info}")
 
         self.viewer.end_frame()
@@ -2251,4 +2247,10 @@ if __name__ == "__main__":
         resample_dist=custom_args.resample_dist
     )
 
+    import time
+    time_start = time.time()
+
     newton.examples.run(example, args)
+
+    time_end = time.time()
+    print(f"Total simulation time: {time_end - time_start:.2f} seconds")

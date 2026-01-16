@@ -15,86 +15,12 @@ import multiprocessing as mp
 from config import BRUSH_UP_POSITION, MAX_GRAVITY
 from simulation.model.brush import Brush
 from simulation.model.constraints import VariableDistanceConstraint, FixedPointConstraint, DistanceConstraint, \
-    BendingConstraint, AlignmentConstraint
+    BendingConstraint, AlignmentConstraint, CollisionConstraint
 
 # 使用无界面后端，便于子进程并行渲染
 matplotlib.use("Agg")
 
 PLANE_Z = 0.25
-
-
-def _render_single_frame(args: Tuple[int, torch.Tensor, Path]):
-    """在子进程中渲染单帧并保存为 PNG。
-
-    参数:
-    - args: (frame_index, coords(Nx3), out_dir)
-    """
-    i, coords, out_dir = args
-    # Convert tensor to numpy if needed for matplotlib
-    if isinstance(coords, torch.Tensor):
-        coords = coords.numpy()
-    # 每个子进程独立创建 Figure，互不干扰
-    fig = plt.figure(figsize=(8, 6))
-    ax = fig.add_subplot(111, projection='3d')
-    sc = ax.scatter(
-        coords[:, 0], coords[:, 1], coords[:, 2],
-        c=coords[:, 2], cmap='viridis', s=10, alpha=0.8
-    )
-    ax.set_xlabel('X')
-    ax.set_ylabel('Y')
-    ax.set_zlabel('Z')
-    ax.set_title(f'Step {i + 1}')
-    ax.set_xlim(-0.1, 1.1)
-    ax.set_ylim(-0.1, 1.1)
-    ax.set_zlim(0, 1.0)
-    # 保持颜色条一致性可选：不同帧范围可能不同，这里按全局固定不易实现，使用每帧自适应
-    # 保存帧
-    out_path = out_dir / f"frame_{i:05d}.png"
-    fig.tight_layout()
-    fig.savefig(out_path, dpi=120)
-    plt.close(fig)
-    return str(out_path)
-
-
-@wp.kernel
-def solve_ground_collision(
-        positions: wp.array(dtype=wp.vec3d, ndim=3),
-        time_step: int,
-        velocities: wp.array(dtype=wp.vec3d, ndim=2),
-        inv_masses: wp.array(dtype=wp.float64, ndim=2),
-        restitution: wp.float64,
-        friction: wp.float64,
-        num_particles: int
-):
-    batch_id, tid = wp.tid()
-    if tid >= num_particles:
-        return
-
-    if inv_masses[batch_id, tid] <= 0.0:  # Fixed particles
-        return
-
-    pos = positions[batch_id, time_step, tid]
-    vel = velocities[batch_id, tid]
-
-    # Ground collision (z = 0)
-    if pos[2] < wp.float64(0.0):
-        # Correct position
-        positions[batch_id, time_step, tid] = wp.vec3d(pos[0], pos[1], wp.float64(0.0))
-
-        # Apply restitution and friction
-        vel_normal = vel[2]
-        vel_tangent = wp.vec3d(vel[0], vel[1], wp.float64(0.0))
-
-        if vel_normal < wp.float64(0.0):
-            vel_normal = -vel_normal * restitution
-            vel_tangent = vel_tangent * (wp.float64(1.0) - friction)
-            velocities[batch_id, tid] = wp.vec3d(vel_tangent[0], vel_tangent[1], vel_normal)
-
-
-@wp.kernel
-def step_time_id(time_id: int):
-    pass
-    # time_id += 1
 
 
 @wp.kernel
@@ -118,15 +44,27 @@ def compute_l1_loss(
 
 
 @wp.kernel
+def copy_now_to_prev(
+        positions: wp.array(dtype=wp.vec3d, ndim=3),
+        num_particles: int
+):
+    """将 now_position (1) 拷贝到 prev_position (0)，用于下一个时间步开始前"""
+    batch_id, tid = wp.tid()
+    if tid >= num_particles:
+        return
+    positions[batch_id, 0, tid] = positions[batch_id, 1, tid]
+
+
+@wp.kernel
 def integrate_particles(
         positions: wp.array(dtype=wp.vec3d, ndim=3),
         velocities: wp.array(dtype=wp.vec3d, ndim=2),
         inv_masses: wp.array(dtype=wp.float64, ndim=2),
         external_forces: wp.array(dtype=wp.vec3d, ndim=2),
         dt: wp.float64,
-        num_particles: int,
-        time_id: int
+        num_particles: int
 ):
+    """积分粒子位置。始终在 now_position (1) 上操作"""
     batch_id, tid = wp.tid()
     if tid >= num_particles:
         return
@@ -155,7 +93,8 @@ def integrate_particles(
         if displacement_magnitude > max_displacement:
             displacement = displacement * (max_displacement / displacement_magnitude)
 
-        positions[batch_id, time_id, tid] = positions[batch_id, time_id, tid] + displacement
+        # 固定使用 time_step=1 (now_position)
+        positions[batch_id, 1, tid] = positions[batch_id, 1, tid] + displacement
 
 
 @wp.kernel
@@ -234,6 +173,43 @@ def apply_rotation_displacement_to_fixed_positions(
 
 
 @wp.kernel
+def apply_absolute_transform_to_fixed_positions(
+        fixed_positions: wp.array(dtype=wp.vec3d, ndim=2),
+        fixed_local_coords: wp.array(dtype=wp.vec3d, ndim=1),  # 固定粒子相对于笔杆中心的局部坐标
+        brush_center: wp.array(dtype=wp.vec3d, ndim=1),  # 每个batch的笔杆中心位置
+        absolute_rotation: wp.array(dtype=wp.vec4d, ndim=1),  # 每个batch的绝对旋转四元数 (w, x, y, z)
+        num_fixed: int
+):
+    """根据绝对位置和绝对旋转直接计算每个固定粒子的世界坐标
+
+    每个固定粒子的新位置 = 笔杆中心位置 + 旋转后的局部坐标
+    
+    Args:
+        fixed_positions: 固定粒子位置数组 (batch_size, num_fixed, 3)
+        fixed_local_coords: 固定粒子相对于笔杆中心的初始局部坐标 (num_fixed, 3)
+        brush_center: 当前笔杆中心的绝对位置 (batch_size, 3)
+        absolute_rotation: 当前笔杆的绝对旋转四元数 (batch_size, 4)，格式为 (w, x, y, z)
+        num_fixed: 固定粒子数量
+    """
+    batch_id, tid = wp.tid()
+    if tid >= num_fixed:
+        return
+
+    # 获取当前笔杆中心和绝对旋转
+    center = brush_center[batch_id]
+    quat = absolute_rotation[batch_id]  # 绝对旋转四元数 (w, x, y, z)
+
+    # 获取该固定粒子的局部坐标
+    local_coord = fixed_local_coords[tid]
+
+    # 使用四元数旋转局部坐标
+    rotated_local = quat_rotate_vector(quat, local_coord)
+
+    # 计算新的世界坐标
+    fixed_positions[batch_id, tid] = center + rotated_local
+
+
+@wp.kernel
 def update_brush_center_and_rotation(
         brush_center: wp.array(dtype=wp.vec3d, ndim=2),
         rotation_seq: wp.array(dtype=wp.vec4d, ndim=2),
@@ -262,51 +238,16 @@ def apply_prev_pos_to_now_pos(
         fixed_positions: wp.array(dtype=wp.vec3d, ndim=2),
         fixed_indices: wp.array(dtype=int),
         inv_mass: wp.array(dtype=wp.float64, ndim=2),
-        disp_seq: wp.array(dtype=wp.vec3d, ndim=2),
-        time_id_now: int,
         num_particles: int
 ):
+    """将固定位置应用到 now_position (1)"""
     batch_id, tid = wp.tid()
     if tid >= num_particles:
         return
 
     idx = fixed_indices[tid]
-    d = disp_seq[batch_id, time_id_now]
-    positions[batch_id, time_id_now, idx] = fixed_positions[batch_id, tid]
-
-
-@wp.kernel
-def record_ink_collision(
-        positions: wp.array(dtype=wp.vec3d, ndim=3),
-        time_step: int,
-        inv_masses: wp.array(dtype=wp.float64, ndim=2),
-        ink_canvas: wp.array(dtype=wp.float64, ndim=2),
-        canvas_resolution: int,
-        num_particles: int
-):
-    batch_id, tid = wp.tid()
-    if tid >= num_particles:
-        return
-
-    if inv_masses[batch_id, tid] <= 0.0:
-        return
-    if time_step == 0:
-        return
-    pos = positions[batch_id, time_step, tid]
-    prev_pos = positions[batch_id, time_step - 1, tid]
-
-    if (prev_pos[2] > wp.float64(0.0) and pos[2] <= wp.float64(0.0)) or (pos[2] <= wp.float64(0.0)):
-        x_canvas = wp.clamp(pos[0], wp.float64(0.0), wp.float64(1.0))
-        y_canvas = wp.clamp(pos[1], wp.float64(0.0), wp.float64(1.0))
-
-        pixel_x = int(x_canvas * wp.float64(canvas_resolution - 1))
-        pixel_y = int(y_canvas * wp.float64(canvas_resolution - 1))
-
-        pixel_x = wp.clamp(pixel_x, 0, canvas_resolution - 1)
-        pixel_y = wp.clamp(pixel_y, 0, canvas_resolution - 1)
-
-        pixel_idx = pixel_y * canvas_resolution + pixel_x
-        wp.atomic_add(ink_canvas, batch_id, pixel_idx, wp.float64(1.0))
+    # 固定使用 time_step=1 (now_position)
+    positions[batch_id, 1, idx] = fixed_positions[batch_id, tid]
 
 
 import warp as wp
@@ -315,7 +256,6 @@ import warp as wp
 @wp.kernel
 def record_ink_collision_hard(
         positions: wp.array(dtype=wp.vec3d, ndim=3),
-        time_step: int,
         inv_masses: wp.array(dtype=wp.float64, ndim=2),
         ink_canvas: wp.array(dtype=wp.float64, ndim=2),
         canvas_resolution: int,
@@ -327,11 +267,13 @@ def record_ink_collision_hard(
         min_y: float,
         max_y: float
 ):
+    """记录墨迹碰撞（硬边）。固定使用 time_step=1 (now_position)"""
     batch_id, tid = wp.tid()
     if tid >= num_particles:
         return
 
-    pos = positions[batch_id, time_step, tid]
+    # 固定使用 time_step=1 (now_position)
+    pos = positions[batch_id, 1, tid]
 
     # 这里的 PLANE_Z 需要确保在外部定义或作为常量传入，假设原逻辑依然需要判断高度
     # 注意：如果原本是在全局变量里定义的 PLANE_Z，请确保 kernel 能访问到
@@ -363,85 +305,9 @@ def record_ink_collision_hard(
         # 直接添加固定强度 1.0，或者你可以根据需要添加 inv_masses[batch_id, tid]
         wp.atomic_add(ink_canvas, batch_id, pixel_idx, wp.float64(1.0))
 
-
-@wp.kernel
-def record_ink_collision_soft(
-        positions: wp.array(dtype=wp.vec3d, ndim=3),
-        time_step: int,
-        inv_masses: wp.array(dtype=wp.float64, ndim=2),
-        ink_canvas: wp.array(dtype=wp.float64, ndim=2),
-        canvas_resolution: int,
-        num_particles: int,
-        sigma_px: wp.float64,
-        radius_px: int,
-        min_x: float,
-        max_x: float,
-        min_y: float,
-        max_y: float
-):
-    batch_id, tid = wp.tid()
-    if tid >= num_particles:
-        return
-
-    pos = positions[batch_id, time_step, tid]
-
-    if not pos[2] <= wp.float64(0.002) + wp.float64(PLANE_Z):
-        return
-
-    # xy coordinate mapping
-    px = wp.clamp(pos[0], wp.float64(min_x), wp.float64(max_x))
-    py = wp.clamp(pos[1], wp.float64(min_y), wp.float64(max_y))
-
-    resm1 = wp.float64(canvas_resolution - 1)
-
-    # Map x from [min_x, max_x] to [0, resm1] (Left -> Right)
-    gx = (px - wp.float64(min_x)) / (wp.float64(max_x) - wp.float64(min_x)) * resm1
-
-    # Map y from [min_y, max_y] to [resm1, 0] (Top -> Bottom, assuming image y-axis points down)
-    # Note: original code did `gy = resm1 - ...`, consistent with y-axis pointing up in world space
-    gy = (wp.float64(max_y) - py) / (wp.float64(max_y) - wp.float64(min_y)) * resm1
-
-    abs_z = wp.abs(pos[2])
-    dynamic_sigma = wp.float64(1.0) / (wp.exp(wp.float64(10.0) * abs_z))
-    base_px = int(wp.floor(gx))
-    base_py = int(wp.floor(gy))
-
-    radius_px = radius_px * int(dynamic_sigma)
-
-    px0 = base_px - radius_px
-    py0 = base_py - radius_px
-    if px0 < 0:
-        px0 = 0
-    if py0 < 0:
-        py0 = 0
-    px1 = base_px + radius_px
-    py1 = base_py + radius_px
-    max_idx = canvas_resolution - 1
-    if px1 > max_idx:
-        px1 = max_idx
-    if py1 > max_idx:
-        py1 = max_idx
-
-    sigma_eff = sigma_px * dynamic_sigma
-
-    inv_two_sigma2 = wp.float64(1.0) / (wp.float64(2.0) * sigma_eff * sigma_eff + wp.float64(1e-12))
-
-    for yy in range(py0, py1 + 1):
-        cy = wp.float64(yy) + wp.float64(0.5)
-        dy = gy - cy
-        for xx in range(px0, px1 + 1):
-            cx = wp.float64(xx) + wp.float64(0.5)
-            dx = gx - cx
-            d2 = dx * dx + dy * dy
-            w = wp.exp(-d2 * inv_two_sigma2)
-            pixel_idx = yy * canvas_resolution + xx
-            wp.atomic_add(ink_canvas, batch_id, pixel_idx, w)
-
-
 @wp.kernel
 def solve_distance_constraints(
         positions: wp.array(dtype=wp.vec3d, ndim=3),
-        time_id: int,
         inv_masses: wp.array(dtype=wp.float64, ndim=2),
         constraint_indices: wp.array(dtype=wp.vec2i),
         rest_distances: wp.array(dtype=wp.float64),
@@ -453,6 +319,7 @@ def solve_distance_constraints(
         dt: wp.float64,
         num_constraints: int
 ):
+    """距离约束求解器。固定使用 time_step=1 (now_position)"""
     batch_id, tid = wp.tid()
     if tid >= num_constraints:
         return
@@ -460,8 +327,9 @@ def solve_distance_constraints(
     idx = constraint_indices[tid]
     i, j = idx[0], idx[1]
 
-    xi = positions[batch_id, time_id, i]
-    xj = positions[batch_id, time_id, j]
+    # 固定使用 time_step=1 (now_position)
+    xi = positions[batch_id, 1, i]
+    xj = positions[batch_id, 1, j]
 
     diff = xi - xj
     current_distance = wp.length(diff)
@@ -518,119 +386,9 @@ def process_ink_canvas(
     v = ink_canvas[batch_id, tid]
     ink_canvas[batch_id, tid] = (wp.float64(1.0) / (wp.float64(1.0) + wp.exp(-v)) - wp.float64(0.5)) * wp.float64(2)
 
-
-import warp as wp
-
-
-# 假设外部定义了 PLANE_Z，如果没有请自行替换为 0.0 或通过参数传入
-# PLANE_Z = 0.0
-
-import warp as wp
-
-
-# @wp.kernel
-# def solve_variable_distance_constraints(
-#         positions: wp.array(dtype=wp.vec3d, ndim=3),
-#         time_id: int,
-#         inv_masses: wp.array(dtype=wp.float64, ndim=2),
-#         constraint_indices: wp.array(dtype=wp.vec2i),
-#         rest_distances: wp.array(dtype=wp.float64),
-#         base_compliances: wp.array(dtype=wp.float64),
-#         lagrange_multipliers: wp.array(dtype=wp.float64),
-#         deltas_x: wp.array(dtype=wp.float64, ndim=2),
-#         deltas_y: wp.array(dtype=wp.float64, ndim=2),
-#         deltas_z: wp.array(dtype=wp.float64, ndim=2),  # 此参数传入但不再被本函数修改
-#         dt: wp.float64,
-#         z_threshold: wp.float64,
-#         weakness_factor: wp.float64,
-#         num_constraints: int
-# ):
-#     batch_id, tid = wp.tid()
-#     if tid >= num_constraints:
-#         return
-#
-#     idx = constraint_indices[tid]
-#     i, j = idx[0], idx[1]
-#
-#     # Get current positions
-#     xi = positions[batch_id, time_id, i]
-#     xj = positions[batch_id, time_id, j]
-#
-#     # ---------------------------------------------------------
-#     # 修改点 1: 计算约束违反时，只考虑 XY 平面
-#     # ---------------------------------------------------------
-#     # 构造一个新的差分向量，其 Z 分量强制为 0
-#     # 这样计算出的 length 就是 2D 平面距离
-#     diff = wp.vec3(xi[0] - xj[0], xi[1] - xj[1], 0.0)
-#
-#     current_distance = wp.length(diff)
-#
-#     epsilon = wp.float64(1e-15)
-#     # Numerical stability check
-#     if current_distance < wp.float64(epsilon):
-#         return
-#
-#     violation = current_distance - rest_distances[tid]
-#     n = diff / current_distance  # 此时 n 的 z 分量也是 0
-#
-#     # Calculate denominator for constraint resolution
-#     w_sum = inv_masses[batch_id, i] + inv_masses[batch_id, j]
-#     if w_sum < wp.float64(epsilon):
-#         return
-#
-#     # 计算基于z坐标的动态compliance (保留原逻辑，根据物体高度决定刚度)
-#     # 注意：这里依然使用原始坐标的 Z 值来判断是否处于"松弛"状态
-#     avg_z = (xi[2] + xj[2]) * wp.float64(0.5)
-#     abs_z = wp.abs(avg_z)
-#
-#     dynamic_compliance = base_compliances[tid]
-#     # if abs_z > z_threshold + wp.float64(PLANE_Z):
-#     #     dynamic_compliance = wp.float64(1.0)
-#
-#     alpha = wp.max(dynamic_compliance / (dt * dt), epsilon)
-#     denom = w_sum + alpha
-#
-#     # Calculate delta lambda with clamping
-#     numerator = -(violation + alpha * lagrange_multipliers[tid])
-#     delta_lambda = numerator / denom
-#
-#     # Clamp delta lambda to prevent explosive corrections
-#     max_correction = wp.float64(0.1) * rest_distances[tid]
-#     delta_lambda = wp.clamp(delta_lambda, -max_correction, max_correction)
-#
-#     # Update lagrange multiplier
-#     lagrange_multipliers[tid] = lagrange_multipliers[tid] + delta_lambda
-#
-#     # Apply position corrections with stability check
-#     correction = delta_lambda * n
-#     correction_magnitude = wp.length(correction)
-#
-#     # Limit correction magnitude
-#     if correction_magnitude > max_correction:
-#         correction = correction * (max_correction / correction_magnitude)
-#
-#     # ---------------------------------------------------------
-#     # 修改点 2: 应用 Delta 时，只更新 X 和 Y，不更新 Z
-#     # ---------------------------------------------------------
-#     # correction[2] 已经是 0 了，所以 deltas_z 不需要加，直接注释掉或删除相关代码
-#
-#     if inv_masses[batch_id, i] > wp.float64(0.0):
-#         ci = inv_masses[batch_id, i] * correction
-#         wp.atomic_add(deltas_x, batch_id, i, ci[0])
-#         wp.atomic_add(deltas_y, batch_id, i, ci[1])
-#         # wp.atomic_add(deltas_z, batch_id, i, ci[2]) # 移除对 Z 的影响
-#
-#     if inv_masses[batch_id, j] > wp.float64(0.0):
-#         cj = -inv_masses[batch_id, j] * correction
-#         wp.atomic_add(deltas_x, batch_id, j, cj[0])
-#         wp.atomic_add(deltas_y, batch_id, j, cj[1])
-#         # wp.atomic_add(deltas_z, batch_id, j, cj[2]) # 移除对 Z 的影响
-
-
 @wp.kernel
 def solve_alignment_constraints(
         positions: wp.array(dtype=wp.vec3d, ndim=3),
-        time_id: int,
         inv_masses: wp.array(dtype=wp.float64, ndim=2),
         constraint_indices: wp.array(dtype=wp.vec3i),
         rest_ratios: wp.array(dtype=wp.float64),
@@ -642,6 +400,7 @@ def solve_alignment_constraints(
         dt: wp.float64,
         num_constraints: int
 ):
+    """对齐约束求解器。固定使用 time_step=1 (now_position)"""
     batch_id, tid = wp.tid()
     if tid >= num_constraints:
         return
@@ -650,9 +409,10 @@ def solve_alignment_constraints(
     i, j, k = idx[0], idx[1], idx[2]
 
     # Get positions: i, j are fixed (start, end), k is free
-    p_start = positions[batch_id, time_id, i]
-    p_end = positions[batch_id, time_id, j]
-    p_free = positions[batch_id, time_id, k]
+    # 固定使用 time_step=1 (now_position)
+    p_start = positions[batch_id, 1, i]
+    p_end = positions[batch_id, 1, j]
+    p_free = positions[batch_id, 1, k]
 
     # Axis vector from start to end
     axis = p_end - p_start
@@ -664,29 +424,37 @@ def solve_alignment_constraints(
 
     # New projection definition: Use stored ratio to determine target position along the line
     ratio = rest_ratios[tid]
-    # To handle potential scaling of the brush (though fixed points distance implies scale), we can use the ratio.
-    # If the brush scale changes, the distance between p_start and p_end changes, and ratio * (p_end - p_start) scales accordingly.
-    # However, if we stored exact distance `rest_distance` from start, we would need to normalize by current axis length or just add dist * dir.
-    # Using ratio is safer if the fixed part stretches (soft constraints), but here it's "fixed" relative to brush, so it's consistent.
-    # But wait, user asked: "新的投影位置定义是沿着两个固定点形成的直线行进同样的距离"
-    # "同样的距离" implies absolute distance, not ratio.
-    # BUT if the brush rotates/translates, the distance is preserved.
-    # Let's interpret "Same distance" as "Same distance from start point as it was initially".
-    # Since alignment constraint is usually for "straightness", using the ratio * current_axis_vector is equivalent if axis length is constant.
-    # And correct if axis length changes (stretches).
-    # If I used absolute distance: target = p_start + normalize(axis) * initial_dist.
-    # If I use ratio: target = p_start + (p_end - p_start) * ratio. (where ratio = initial_dist / initial_axis_len).
-    # If p_start and p_end are "Fixed" particles (relative to brush frame), their distance should be constant (rigid).
-    # So both are effectively the same.
-    # The ratio implementation is slightly cheaper (no sqrt for normalize if not needed, but wait, ratio * vector handles direction and length).
-    # Ratio approach: target = p_start + axis * ratio.
-    
+
     # Calculate target position
     p_proj = p_start + axis * ratio
 
-    # Distance vector from projection to free point
-    diff = p_free - p_proj
-    dist = wp.length(diff)
+    limit_plane_z = wp.float64(0.25)
+    if p_proj[2] < limit_plane_z:
+        if wp.abs(axis[2]) > eps:
+            t_int = (limit_plane_z - p_start[2]) / axis[2]
+            p_int = p_start + axis * t_int
+
+            # distance between original projected point and intersection
+            dist_p_i = wp.length(p_proj - p_int)
+
+            # direction from intersection to projected point in xy plane
+            dir_x = p_proj[0] - p_int[0]
+            dir_y = p_proj[1] - p_int[1]
+            mag_xy = wp.sqrt(dir_x * dir_x + dir_y * dir_y)
+
+            if mag_xy > eps:
+                scale = dist_p_i / mag_xy
+                p_proj = wp.vec3d(p_int[0] + dir_x * scale, p_int[1] + dir_y * scale, limit_plane_z)
+            else:
+                p_proj = p_int
+
+        # Distance vector from projection to free point
+        diff = (p_free - p_proj) * wp.float64(1.2)
+        dist = wp.length(diff)
+    else:
+        # Distance vector from projection to free point
+        diff = p_free - p_proj
+        dist = wp.length(diff)
 
     if dist < eps:
         return
@@ -710,7 +478,7 @@ def solve_alignment_constraints(
 
     # Correction
     correction = delta_lambda * n * w_free
-    
+
     # We only update the free particle
     wp.atomic_add(deltas_x, batch_id, k, correction[0])
     wp.atomic_add(deltas_y, batch_id, k, correction[1])
@@ -718,111 +486,14 @@ def solve_alignment_constraints(
 
 
 @wp.kernel
-def solve_bending_constraints(
-        positions: wp.array(dtype=wp.vec3d, ndim=3),
-        time_id: int,
-        inv_masses: wp.array(dtype=wp.float64, ndim=2),
-        constraint_indices: wp.array(dtype=wp.vec3i),  # (i, j, k) 三个粒子索引
-        rest_distances: wp.array(dtype=wp.float64),  # i到k的直线距离
-        compliances: wp.array(dtype=wp.float64),
-        lagrange_multipliers: wp.array(dtype=wp.float64),
-        deltas_x: wp.array(dtype=wp.float64, ndim=2),
-        deltas_y: wp.array(dtype=wp.float64, ndim=2),
-        deltas_z: wp.array(dtype=wp.float64, ndim=2),
-        dt: wp.float64,
-        num_constraints: int
-):
-    """
-    弯曲距离约束求解器 - 约束首尾两点的距离以保持直线形态
-
-    对于三个连续粒子 i, j, k，约束 |i-k| = rest_distance
-    其中 rest_distance = |i-j| + |j-k|（直线时的距离）
-
-    这是一个简单的距离约束，比角度约束更加数值稳定
-    """
-    batch_id, tid = wp.tid()
-    if tid >= num_constraints:
-        return
-
-    idx = constraint_indices[tid]
-    i = idx[0]
-    j = idx[1]  # 中间点（不直接参与此约束，但用于记录）
-    k = idx[2]
-
-    # 获取首尾两点的位置
-    xi = positions[batch_id, time_id, i]
-    xk = positions[batch_id, time_id, k]
-
-    # 计算当前距离
-    diff = xi - xk
-    current_distance = wp.length(diff)
-
-    epsilon = wp.float64(1e-10)
-    if current_distance < epsilon:
-        return
-
-    # 约束违背量
-    rest_dist = rest_distances[tid]
-    violation = current_distance - rest_dist
-
-    # 如果违背量很小，跳过
-    if wp.abs(violation) < epsilon:
-        return
-
-    # 梯度方向（归一化的连接向量）
-    n = diff / current_distance
-
-    # 计算有效质量
-    w_i = inv_masses[batch_id, i]
-    w_k = inv_masses[batch_id, k]
-    w_sum = w_i + w_k
-
-    if w_sum < epsilon:
-        return
-
-    # XPBD compliance
-    alpha = compliances[tid] / (dt * dt)
-    if alpha < epsilon:
-        alpha = epsilon
-    denom = w_sum + alpha
-
-    # 计算拉格朗日乘子增量
-    prev_lambda = lagrange_multipliers[tid]
-    numerator = -(violation + alpha * prev_lambda)
-    delta_lambda = numerator / denom
-
-    # 限制最大修正量
-    max_correction = wp.float64(0.1) * rest_dist
-    delta_lambda = wp.clamp(delta_lambda, -max_correction, max_correction)
-
-    # 更新拉格朗日乘子
-    lagrange_multipliers[tid] = prev_lambda + delta_lambda
-
-    # 应用位置修正
-    correction = delta_lambda * n
-
-    if w_i > wp.float64(0.0):
-        ci = w_i * correction
-        wp.atomic_add(deltas_x, batch_id, i, ci[0])
-        wp.atomic_add(deltas_y, batch_id, i, ci[1])
-        wp.atomic_add(deltas_z, batch_id, i, ci[2])
-
-    if w_k > wp.float64(0.0):
-        ck = -w_k * correction
-        wp.atomic_add(deltas_x, batch_id, k, ck[0])
-        wp.atomic_add(deltas_y, batch_id, k, ck[1])
-        wp.atomic_add(deltas_z, batch_id, k, ck[2])
-
-
-@wp.kernel
 def apply_and_clear_deltas(
         positions: wp.array(dtype=wp.vec3d, ndim=3),
-        time_id: int,
         deltas_x: wp.array(dtype=wp.float64, ndim=2),
         deltas_y: wp.array(dtype=wp.float64, ndim=2),
         deltas_z: wp.array(dtype=wp.float64, ndim=2),
         num_particles: int
 ):
+    """应用并清除位移增量。固定使用 time_step=1 (now_position)"""
     batch_id, tid = wp.tid()
     if tid >= num_particles:
         return
@@ -830,7 +501,8 @@ def apply_and_clear_deltas(
     dy = deltas_y[batch_id, tid]
     dz = deltas_z[batch_id, tid]
     if dx != wp.float64(0.0) or dy != wp.float64(0.0) or dz != wp.float64(0.0):
-        positions[batch_id, time_id, tid] = positions[batch_id, time_id, tid] + wp.vec3d(dx, dy, dz)
+        # 固定使用 time_step=1 (now_position)
+        positions[batch_id, 1, tid] = positions[batch_id, 1, tid] + wp.vec3d(dx, dy, dz)
     deltas_x[batch_id, tid] = wp.float64(0.0)
     deltas_y[batch_id, tid] = wp.float64(0.0)
     deltas_z[batch_id, tid] = wp.float64(0.0)
@@ -839,7 +511,6 @@ def apply_and_clear_deltas(
 @wp.kernel
 def solve_plane_constraints(
         positions: wp.array(dtype=wp.vec3d, ndim=3),
-        time_id: int,
         inv_masses: wp.array(dtype=wp.float64, ndim=2),
         plane_normals: wp.array(dtype=wp.vec3d),
         plane_distances: wp.array(dtype=wp.float64),
@@ -851,6 +522,7 @@ def solve_plane_constraints(
         dt: wp.float64,
         num_particles: int,
 ):
+    """平面约束求解器。固定使用 time_step=1 (now_position)"""
     batch_id, tid = wp.tid()
     if tid >= num_particles:
         return
@@ -858,7 +530,8 @@ def solve_plane_constraints(
     if inv_masses[batch_id, tid] <= wp.float64(0.0):  # Fixed particles
         return
 
-    pos = positions[batch_id, time_id, tid]
+    # 固定使用 time_step=1 (now_position)
+    pos = positions[batch_id, 1, tid]
 
     # Check against all planes
     plane_idx = 0
@@ -914,55 +587,38 @@ def solve_plane_constraints(
 @wp.kernel
 def apply_fixed_constraints_gradient_preserving(
         positions: wp.array(dtype=wp.vec3d, ndim=3),
-        time_step: int,
         velocities: wp.array(dtype=wp.vec3d, ndim=2),
         fixed_positions: wp.array(dtype=wp.vec3d, ndim=2),
         fixed_indices: wp.array(dtype=int),
         num_fixed: int,
         stiffness: wp.float64  # 软约束强度 (0,1]，越接近1越“硬”
 ):
+    """应用固定约束（保持梯度）。固定使用 time_step=1 (now_position)"""
     batch_id, tid = wp.tid()
     if tid >= num_fixed:
         return
 
     idx = fixed_indices[tid]
-    # 计算当前位置与目标位置的差异
-    current_pos = positions[batch_id, time_step, idx]
-    target_pos = fixed_positions[batch_id, tid]
-    diff = target_pos - current_pos
-
-    # 软约束：只移动 diff 的 stiffness 比例
-    new_pos = current_pos + diff * stiffness
-    positions[batch_id, time_step, idx] = new_pos
-
-    # 速度软阻尼：保留一部分原速度，防止数值震荡，同时保持梯度流动
-    v = velocities[batch_id, idx]
-    one = wp.float64(1.0)
-    clamped_stiff = wp.clamp(stiffness, wp.float64(0.0), one)
-    # 速度趋向 0，但不是直接清零：v_new = (1 - clamped_stiff)*v
-    velocities[batch_id, idx] = v * (one - clamped_stiff)
+    # 固定使用 time_step=1 (now_position)
+    positions[batch_id, 1, idx] = fixed_positions[batch_id, tid]
 
 
 @wp.kernel
 def update_velocities(
         positions: wp.array(dtype=wp.vec3d, ndim=3),
-        time_step: int,
-        disp_seq: wp.array(dtype=wp.vec3d, ndim=2),
         velocities: wp.array(dtype=wp.vec3d, ndim=2),
         inv_masses: wp.array(dtype=wp.float64, ndim=2),
         dt: wp.float64,
         num_particles: int
 ):
+    """更新速度。使用固定的 time_step=0 表示 prev_position，time_step=1 表示 now_position"""
     batch_id, tid = wp.tid()
-    if tid >= num_particles or time_step == 0:
-        return
-
-    if time_step == 0 and inv_masses[batch_id, tid] > wp.float64(0.0):
-        velocities[batch_id, tid] = disp_seq[batch_id, time_step] / dt
+    if tid >= num_particles:
         return
 
     if inv_masses[batch_id, tid] > wp.float64(0.0):
-        velocities[batch_id, tid] = (positions[batch_id, time_step, tid] - positions[batch_id, time_step, tid]) / dt
+        # 使用 now_position (1) - prev_position (0) 计算速度
+        velocities[batch_id, tid] = (positions[batch_id, 1, tid] - positions[batch_id, 0, tid]) / dt
 
 
 @wp.kernel
@@ -988,6 +644,173 @@ def apply_velocity_damping_and_clamp(
     velocities[batch_id, tid] = v
 
 
+@wp.kernel
+def detect_collisions(
+        positions: wp.array(dtype=wp.vec3d, ndim=3),
+        inv_masses: wp.array(dtype=wp.float64, ndim=2),
+        hair_particle_start: wp.array(dtype=int),  # 每根毛发的起始粒子索引
+        hair_particle_count: wp.array(dtype=int),  # 每根毛发的粒子数量
+        collision_pairs: wp.array(dtype=wp.vec2i, ndim=2),  # 输出：碰撞粒子对 (batch, max_pairs, 2)
+        collision_count: wp.array(dtype=int, ndim=1),  # 输出：每个batch的碰撞对数量
+        collision_radius: wp.float64,
+        num_hairs: int,
+        max_collision_pairs: int
+):
+    """检测不同毛发之间的粒子碰撞
+    
+    为了避免同一根毛发内部的粒子碰撞（它们已经有距离约束），
+    只检测不同毛发之间的碰撞。
+    """
+    batch_id, pair_id = wp.tid()
+    
+    # pair_id 编码了两根毛发的索引 (hair_i, hair_j)，其中 hair_i < hair_j
+    # 总共有 C(num_hairs, 2) = num_hairs * (num_hairs - 1) / 2 对
+    total_pairs = (num_hairs * (num_hairs - 1)) / 2
+    if wp.float64(pair_id) >= total_pairs:
+        return
+    
+    # 使用数学公式直接从 pair_id 计算 hair_i 和 hair_j
+    # 对于上三角矩阵索引，pair_id 与 (hair_i, hair_j) 的关系:
+    # pair_id = hair_i * num_hairs - hair_i * (hair_i + 1) / 2 + (hair_j - hair_i - 1)
+    # 使用求根公式反解 hair_i:
+    # hair_i = floor((2*n - 1 - sqrt((2*n-1)^2 - 8*pair_id)) / 2)
+    n = wp.float64(num_hairs)
+    k = wp.float64(pair_id)
+    
+    # 计算 hair_i: 使用二次方程求根公式
+    # 从 k = i*(n-1) - i*(i-1)/2 + (j-i-1) 反解
+    # 简化后: i = floor((2n - 1 - sqrt((2n-1)^2 - 8k)) / 2)
+    discriminant = (wp.float64(2.0) * n - wp.float64(1.0)) * (wp.float64(2.0) * n - wp.float64(1.0)) - wp.float64(8.0) * k
+    hair_i_float = (wp.float64(2.0) * n - wp.float64(1.0) - wp.sqrt(discriminant)) / wp.float64(2.0)
+    hair_i = int(wp.floor(hair_i_float))
+    
+    # 计算 hair_j: 基于 hair_i 计算偏移
+    # pair_id = hair_i * (num_hairs - 1) - hair_i * (hair_i - 1) / 2 + (hair_j - hair_i - 1)
+    # 简化: pair_id = hair_i * num_hairs - hair_i * (hair_i + 1) / 2 + hair_j - hair_i - 1
+    i_f = wp.float64(hair_i)
+    base_idx = int(i_f * n - i_f * (i_f + wp.float64(1.0)) / wp.float64(2.0))
+    hair_j = hair_i + 1 + (pair_id - base_idx)
+    
+    # 边界检查
+    if hair_i < 0 or hair_i >= num_hairs - 1 or hair_j <= hair_i or hair_j >= num_hairs:
+        return
+    
+    # 获取两根毛发的粒子范围
+    start_i = hair_particle_start[hair_i]
+    count_i = hair_particle_count[hair_i]
+    start_j = hair_particle_start[hair_j]
+    count_j = hair_particle_count[hair_j]
+    
+    collision_dist = collision_radius * wp.float64(2.0)
+    collision_dist_sq = collision_dist * collision_dist
+    
+    # 检测两根毛发之间的所有粒子对
+    for pi in range(count_i):
+        particle_i = start_i + pi
+        # 跳过固定粒子
+        if inv_masses[batch_id, particle_i] <= wp.float64(0.0):
+            continue
+            
+        pos_i = positions[batch_id, 1, particle_i]
+        
+        for pj in range(count_j):
+            particle_j = start_j + pj
+            # 跳过固定粒子
+            if inv_masses[batch_id, particle_j] <= wp.float64(0.0):
+                continue
+                
+            pos_j = positions[batch_id, 1, particle_j]
+            diff = pos_i - pos_j
+            dist_sq = wp.dot(diff, diff)
+            
+            if dist_sq < collision_dist_sq and dist_sq > wp.float64(1e-12):
+                # 发现碰撞，原子性地添加到碰撞对列表
+                idx = wp.atomic_add(collision_count, batch_id, 1)
+                if idx < max_collision_pairs:
+                    collision_pairs[batch_id, idx] = wp.vec2i(particle_i, particle_j)
+
+
+@wp.kernel
+def solve_collision_constraints(
+        positions: wp.array(dtype=wp.vec3d, ndim=3),
+        inv_masses: wp.array(dtype=wp.float64, ndim=2),
+        collision_pairs: wp.array(dtype=wp.vec2i, ndim=2),
+        collision_count: wp.array(dtype=int, ndim=1),
+        collision_radius: wp.float64,
+        compliance: wp.float64,
+        deltas_x: wp.array(dtype=wp.float64, ndim=2),
+        deltas_y: wp.array(dtype=wp.float64, ndim=2),
+        deltas_z: wp.array(dtype=wp.float64, ndim=2),
+        dt: wp.float64,
+        max_collision_pairs: int
+):
+    """碰撞约束求解器
+    
+    对于每个检测到的碰撞对，如果距离小于碰撞距离，则施加排斥约束将粒子推开。
+    """
+    batch_id, tid = wp.tid()
+    
+    count = collision_count[batch_id]
+    if tid >= count or tid >= max_collision_pairs:
+        return
+    
+    pair = collision_pairs[batch_id, tid]
+    i = pair[0]
+    j = pair[1]
+    
+    pos_i = positions[batch_id, 1, i]
+    pos_j = positions[batch_id, 1, j]
+    
+    diff = pos_i - pos_j
+    dist = wp.length(diff)
+    
+    collision_dist = collision_radius * wp.float64(2.0)
+    
+    epsilon = wp.float64(1e-12)
+    if dist < epsilon or dist >= collision_dist:
+        return
+    
+    # 计算穿透深度（负值表示穿透）
+    penetration = dist - collision_dist
+    
+    # 方向：从 j 指向 i
+    n = diff / (dist + epsilon)
+    
+    w_i = inv_masses[batch_id, i]
+    w_j = inv_masses[batch_id, j]
+    w_sum = w_i + w_j
+    
+    if w_sum < epsilon:
+        return
+    
+    # XPBD 约束求解
+    alpha = compliance / (dt * dt)
+    denom = w_sum + alpha
+    
+    # delta_lambda = -penetration / denom (简化版本，不维护拉格朗日乘子，因为碰撞是瞬时约束)
+    delta_lambda = -penetration / denom
+    
+    # 限制最大修正量
+    max_correction = collision_dist * wp.float64(0.5)
+    delta_lambda = wp.clamp(delta_lambda, -max_correction, max_correction)
+    
+    # 计算位置修正
+    correction = delta_lambda * n
+    
+    # 根据质量比例分配修正量
+    if w_i > wp.float64(0.0):
+        corr_i = correction * (w_i / w_sum)
+        wp.atomic_add(deltas_x, batch_id, i, corr_i[0])
+        wp.atomic_add(deltas_y, batch_id, i, corr_i[1])
+        wp.atomic_add(deltas_z, batch_id, i, corr_i[2])
+    
+    if w_j > wp.float64(0.0):
+        corr_j = -correction * (w_j / w_sum)
+        wp.atomic_add(deltas_x, batch_id, j, corr_j[0])
+        wp.atomic_add(deltas_y, batch_id, j, corr_j[1])
+        wp.atomic_add(deltas_z, batch_id, j, corr_j[2])
+
+
 class XPBDSimulator:
     def __init__(self,
                  dt: float = 1.0 / 60.0,
@@ -1009,7 +832,11 @@ class XPBDSimulator:
                  splat_sigma_px: float = 1.0,  # 高斯核标准差（以像素为单位）
                  splat_radius_px: int = 1,  # 溅射半径（像素，2->5x5 邻域）
                  fixed_stiffness: float = 0.6,  # 软固定约束的收敛强度 (0,1]，越大越“硬”
-                 alignment_compliance: float = 1e-4,  # 对齐约束compliance
+                 alignment_compliance_range: Tuple[float, float] = (1e-4, 1e-4),  # 对齐约束compliance范围 (root, tip)
+                 collision_radius: float = 0.0005,  # 碰撞半径，粒子间距离小于2*collision_radius时产生碰撞
+                 collision_compliance: float = 1e-6,  # 碰撞约束的柔度
+                 enable_collision: bool = True,  # 是否启用碰撞检测
+                 max_collision_pairs: int = 10000,  # 每个batch最大碰撞对数量
                  canvas_min_x: float = 0.0,
                  canvas_max_x: float = 1.0,
                  canvas_min_y: float = 0.0,
@@ -1029,12 +856,14 @@ class XPBDSimulator:
         self.dis_compliance = dis_compliance
         self.variable_dis_compliance = variable_dis_compliance
         self.bending_compliance = bending_compliance
-        self.alignment_compliance = alignment_compliance
+        self.alignment_compliance_range = alignment_compliance_range
+        self.collision_radius = collision_radius
+        self.collision_compliance = collision_compliance
+        self.enable_collision = enable_collision
+        self.max_collision_pairs = max_collision_pairs
         self.damping = damping
         self.restitution = restitution
         self.friction = friction
-
-        self.time_id = 0  # 当前时间步计数器
 
         # 可变距离约束的特殊参数
         self.variable_z_threshold = variable_z_threshold
@@ -1117,12 +946,23 @@ class XPBDSimulator:
         self.use_rotation = False  # 是否使用旋转模式
         self.initial_brush_center = None  # 初始笔杆中心位置
 
+        # 绝对变换模式相关数组
+        self.current_brush_center = None  # 当前笔杆中心位置 (batch_size, 3)
+        self.current_absolute_rotation = None  # 当前绝对旋转四元数 (batch_size, 4)
+
         # Plane constraint arrays (for z=0 plane)
         self.plane_normals = None
         self.plane_distances = None
         self.plane_compliances = None
         self.plane_lambdas = None
         self.num_planes = 0
+
+        # 碰撞约束数组
+        self.hair_particle_start = None  # 每根毛发的起始粒子索引
+        self.hair_particle_count = None  # 每根毛发的粒子数量
+        self.collision_pairs = None  # 碰撞粒子对
+        self.collision_count = None  # 每个batch的碰撞对数量
+        self.num_hairs = 0  # 毛发数量
 
         # Cached counts to avoid repeated host-device sync
         self.num_distance_constraints = 0
@@ -1194,19 +1034,20 @@ class XPBDSimulator:
 
         self.num_particles = len(brush.particles)
 
-        self.time_id = 0
-
         # 存储初始笔杆中心位置（用于旋转计算）
         self.initial_brush_center = brush.root_position.clone().to(torch.float64)
 
         # Extract particle data using torch tensors
-        positions = torch.zeros((self.batch_size, self.num_steps, self.num_particles, 3), dtype=torch.float64).to(
+        # 只需要 2 个时间步：time_step=0 表示 prev_position，time_step=1 表示 now_position
+        positions = torch.zeros((self.batch_size, 2, self.num_particles, 3), dtype=torch.float64).to(
             self.device)
         velocities = torch.zeros((self.batch_size, self.num_particles, 3), dtype=torch.float64).to(self.device)
         inv_masses = torch.ones((self.batch_size, self.num_particles), dtype=torch.float64).to(self.device)
 
         for b in range(self.batch_size):
             for i, particle in enumerate(brush.particles):
+                # 同时初始化 prev_position (0) 和 now_position (1)
+                positions[b, 0, i] = torch.tensor(particle.position, dtype=torch.float64)
                 positions[b, 1, i] = torch.tensor(particle.position, dtype=torch.float64)
                 velocities[b, i] = torch.tensor(particle.velocity, dtype=torch.float64)
                 inv_masses[b, i] = 1.0
@@ -1233,20 +1074,26 @@ class XPBDSimulator:
                                        requires_grad=True)
 
         # Extract constraints (会设置 fixed_local_coords)
-        self._extract_constraints(brush.constraints, brush.root_position)
+        self._extract_constraints(brush.constraints, brush)
 
         # Setup plane constraints (z=0 plane)
         self._setup_plane_constraints()
 
+        # Setup collision detection data structures
+        if self.enable_collision:
+            self._setup_collision_data(brush)
+
         self.particles_initialized = True
 
-    def _extract_constraints(self, constraints, brush_root_position: torch.Tensor = None):
+    def _extract_constraints(self, constraints, brush: Brush = None):
         """Extract and categorize constraints
 
         Args:
             constraints: 约束列表
-            brush_root_position: 笔杆中心位置，用于计算固定粒子的局部坐标
+            brush: Brush 对象，用于获取 root_position 和 tangent_vector 来计算固定粒子的局部坐标
         """
+        brush_root_position = brush.root_position if brush is not None else None
+        brush_tangent_vector = brush.tangent_vector if brush is not None else None
         distance_data = []
         variable_distance_data = []
         bending_data = []
@@ -1290,7 +1137,13 @@ class XPBDSimulator:
                 j = constraint.point_fixed_end.particle_id
                 k = constraint.point_free.particle_id
                 ratio = constraint.rest_ratio
-                compliance = self.alignment_compliance
+
+                # 计算 variable compliance
+                # relative_location: 0.0 (near root) -> 1.0 (tip)
+                comp_start, comp_end = self.alignment_compliance_range
+                t = constraint.relative_location
+                compliance = comp_start + (comp_end - comp_start) * t
+
                 alignment_data.append((i, j, k, ratio, compliance))
 
         # Create distance constraint arrays using torch
@@ -1369,12 +1222,32 @@ class XPBDSimulator:
             self._fixed_indices_host = fixed_indices.cpu().numpy()
 
             # 计算并存储固定粒子相对于笔杆中心的局部坐标（用于旋转）
+            # 注意：这里的局部坐标需要是初始状态（竖直向下）下的坐标
+            # 如果毛笔已经旋转，需要将局部坐标反向旋转回初始状态
             if brush_root_position is not None:
                 brush_center = brush_root_position.to(torch.float64).to(self.device)
                 # 每个固定粒子的局部坐标 = 粒子位置 - 笔杆中心
                 fixed_pos_stack = torch.stack([f[1] for f in fixed_data]).to(torch.float64).to(self.device)
                 local_coords = fixed_pos_stack - brush_center
-                self.fixed_local_coords = wp.from_torch(local_coords, dtype=wp.vec3d)
+                
+                # 如果毛笔有切向量信息，需要将当前坐标反向旋转回初始状态（竖直向下）
+                # 这样 absolute_rotation 才能正确地从初始状态旋转到目标状态
+                if brush_tangent_vector is not None:
+                    from simulation.model.brush import rotation_matrix_from_vectors
+                    tangent = brush_tangent_vector.to(torch.float64)
+                    vertical_down = torch.tensor([0., 0., -1.], dtype=torch.float64)
+                    
+                    # 如果当前切向量不是竖直向下，需要反向旋转
+                    if not torch.allclose(tangent, vertical_down, atol=1e-6):
+                        # 计算从 vertical_down 到 tangent 的旋转矩阵
+                        rot_mat = rotation_matrix_from_vectors(vertical_down, tangent)
+                        # 逆旋转矩阵 = 转置（对于正交旋转矩阵）
+                        inv_rot_mat = rot_mat.T.to(self.device)
+                        # 将每个局部坐标反向旋转
+                        local_coords = (inv_rot_mat @ local_coords.T).T
+                
+                # 确保张量是连续的，warp.from_torch 要求连续张量
+                self.fixed_local_coords = wp.from_torch(local_coords.contiguous(), dtype=wp.vec3d)
 
             # Set inverse mass to zero for fixed particles
             # Convert warp array to torch tensor, modify, then convert back
@@ -1404,6 +1277,50 @@ class XPBDSimulator:
             self.device)
         self.plane_lambdas = wp.from_torch(plane_lambdas, dtype=wp.float64)
 
+    def _setup_collision_data(self, brush: Brush):
+        """Setup data structures for collision detection between hairs
+        
+        为碰撞检测设置数据结构，记录每根毛发的粒子范围信息。
+        """
+        self.num_hairs = len(brush.hairs)
+        
+        if self.num_hairs < 2:
+            # 至少需要2根毛发才能进行碰撞检测
+            self.enable_collision = False
+            return
+        
+        # 构建每根毛发的粒子起始索引和数量
+        hair_starts = []
+        hair_counts = []
+        
+        for hair in brush.hairs:
+            if len(hair.particles) > 0:
+                # 获取该毛发第一个粒子的ID作为起始索引
+                start_idx = hair.particles[0].particle_id
+                count = len(hair.particles)
+                hair_starts.append(start_idx)
+                hair_counts.append(count)
+        
+        self.num_hairs = len(hair_starts)
+        
+        if self.num_hairs < 2:
+            self.enable_collision = False
+            return
+        
+        # 转换为torch tensor并传输到设备
+        hair_starts_tensor = torch.tensor(hair_starts, dtype=torch.int32).to(self.device)
+        hair_counts_tensor = torch.tensor(hair_counts, dtype=torch.int32).to(self.device)
+        
+        self.hair_particle_start = wp.from_torch(hair_starts_tensor, dtype=wp.int32)
+        self.hair_particle_count = wp.from_torch(hair_counts_tensor, dtype=wp.int32)
+        
+        # 分配碰撞对数组
+        collision_pairs = torch.zeros((self.batch_size, self.max_collision_pairs, 2), dtype=torch.int32).to(self.device)
+        collision_count = torch.zeros(self.batch_size, dtype=torch.int32).to(self.device)
+        
+        self.collision_pairs = wp.from_torch(collision_pairs, dtype=wp.vec2i)
+        self.collision_count = wp.from_torch(collision_count, dtype=wp.int32)
+
     def compute_wp_loss(self, batch_id: int = 0):
         self.loss = wp.zeros(1, dtype=wp.float64, device=self.device, requires_grad=True)
         wp.launch(
@@ -1422,6 +1339,8 @@ class XPBDSimulator:
 
     def step(self, start: int, end: int):
         for time_step in range(start, end):
+            # 移除了此处的 copy_now_to_prev，移至 _substep 内部以确保 XPBD 在 substeps > 1 时速度计算正确
+
             if self.use_rotation and self.brush_center is not None:
                 # 使用旋转模式：先更新笔杆中心和累积旋转，然后应用到固定粒子
                 wp.launch(
@@ -1463,6 +1382,7 @@ class XPBDSimulator:
                     ],
                     device=self.device
                 )
+            # 将固定粒子的位置应用到 now_position
             wp.launch(
                 apply_prev_pos_to_now_pos,
                 dim=(self.batch_size, self.num_fixed_constraints),
@@ -1471,15 +1391,26 @@ class XPBDSimulator:
                     self.fixed_positions,
                     self.fixed_indices,
                     self.inv_masses,
-                    self.displacement,
-                    time_step,
                     self.num_particles
                 ],
                 device=self.device
             )
-            self._substep(time_step)
+            for j in range(self.substeps):
+                self._substep()
 
-    def _substep(self, time_step):
+    def _substep(self):
+        """执行一个子步骤。所有位置操作都使用固定的 time_step=1 (now_position)"""
+        # [Fix] 必须在每个子步开始时更新 prev_position，否则 update_velocities 会使用错误的参考位置导致爆炸
+        wp.launch(
+            copy_now_to_prev,
+            dim=(self.batch_size, self.num_particles),
+            inputs=[
+                self.positions,
+                self.num_particles
+            ],
+            device=self.device
+        )
+
         wp.launch(
             integrate_particles,
             dim=(self.batch_size, self.num_particles),
@@ -1489,11 +1420,18 @@ class XPBDSimulator:
                 self.inv_masses,
                 self.external_forces,
                 self.sub_dt,
-                self.num_particles,
-                time_step
+                self.num_particles
             ],
             device=self.device
         )
+        if self.alignment_lambdas is not None:
+            self.alignment_lambdas.zero_()
+        if self.distance_lambdas is not None:
+            self.distance_lambdas.zero_()
+        if self.plane_lambdas is not None:
+            self.plane_lambdas.zero_()
+        if self.bending_lambdas is not None:
+            self.bending_lambdas.zero_()
         # return
         for _ in range(self.iterations):
             if self.distance_indices is not None and self.num_distance_constraints > 0:
@@ -1502,7 +1440,6 @@ class XPBDSimulator:
                     dim=(self.batch_size, self.num_distance_constraints),
                     inputs=[
                         self.positions,
-                        time_step,
                         self.inv_masses,
                         self.distance_indices,
                         self.distance_rest_lengths,
@@ -1517,60 +1454,12 @@ class XPBDSimulator:
                     device=self.device
                 )
 
-                # Solve variable distance constraints
-            # if self.variable_distance_indices is not None and self.num_variable_distance_constraints > 0:
-            #     wp.launch(
-            #         solve_variable_distance_constraints,
-            #         dim=(self.batch_size, self.num_variable_distance_constraints),
-            #         inputs=[
-            #             self.positions,
-            #             time_step,
-            #             self.inv_masses,
-            #             self.variable_distance_indices,
-            #             self.variable_distance_rest_lengths,
-            #             self.variable_distance_compliances,
-            #             self.variable_distance_lambdas,
-            #             self._delta_x,
-            #             self._delta_y,
-            #             self._delta_z,
-            #             self.sub_dt,
-            #             self.variable_z_threshold,
-            #             self.variable_weakness_factor,
-            #             self.num_variable_distance_constraints
-            #         ],
-            #         device=self.device
-            #     )
-
-            # Solve bending constraints for hair stiffness
-            # if self.bending_indices is not None and self.num_bending_constraints > 0:
-            #     wp.launch(
-            #         solve_bending_constraints,
-            #         dim=(self.batch_size, self.num_bending_constraints),
-            #         inputs=[
-            #             self.positions,
-            #             time_step,
-            #             self.inv_masses,
-            #             self.bending_indices,
-            #             self.bending_rest_distances,
-            #             self.bending_compliances,
-            #             self.bending_lambdas,
-            #             self._delta_x,
-            #             self._delta_y,
-            #             self._delta_z,
-            #             self.sub_dt,
-            #             self.num_bending_constraints
-            #         ],
-            #         device=self.device
-            #     )
-
-            # Solve alignment constraints
             if self.alignment_indices is not None and self.num_alignment_constraints > 0:
                 wp.launch(
                     solve_alignment_constraints,
                     dim=(self.batch_size, self.num_alignment_constraints),
                     inputs=[
                         self.positions,
-                        time_step,
                         self.inv_masses,
                         self.alignment_indices,
                         self.alignment_rest_ratios,
@@ -1591,7 +1480,6 @@ class XPBDSimulator:
                 dim=(self.batch_size, self.num_particles),
                 inputs=[
                     self.positions,
-                    time_step,
                     self._delta_x,
                     self._delta_y,
                     self._delta_z,
@@ -1608,7 +1496,6 @@ class XPBDSimulator:
                     dim=(self.batch_size, self.num_particles),
                     inputs=[
                         self.positions,
-                        time_step,
                         self.inv_masses,
                         self.plane_normals,
                         self.plane_distances,
@@ -1629,7 +1516,64 @@ class XPBDSimulator:
                     dim=(self.batch_size, self.num_particles),
                     inputs=[
                         self.positions,
-                        time_step,
+                        self._delta_x,
+                        self._delta_y,
+                        self._delta_z,
+                        self.num_particles
+                    ],
+                    device=self.device
+                )
+
+            # Solve collision constraints (hair-hair collision)
+            if self.enable_collision and self.num_hairs >= 2:
+                # 重置碰撞计数
+                self.collision_count.zero_()
+                
+                # 检测碰撞对
+                num_hair_pairs = (self.num_hairs * (self.num_hairs - 1)) // 2
+                wp.launch(
+                    detect_collisions,
+                    dim=(self.batch_size, num_hair_pairs),
+                    inputs=[
+                        self.positions,
+                        self.inv_masses,
+                        self.hair_particle_start,
+                        self.hair_particle_count,
+                        self.collision_pairs,
+                        self.collision_count,
+                        wp.float64(self.collision_radius),
+                        self.num_hairs,
+                        self.max_collision_pairs
+                    ],
+                    device=self.device
+                )
+                
+                # 求解碰撞约束
+                wp.launch(
+                    solve_collision_constraints,
+                    dim=(self.batch_size, self.max_collision_pairs),
+                    inputs=[
+                        self.positions,
+                        self.inv_masses,
+                        self.collision_pairs,
+                        self.collision_count,
+                        wp.float64(self.collision_radius),
+                        wp.float64(self.collision_compliance),
+                        self._delta_x,
+                        self._delta_y,
+                        self._delta_z,
+                        self.sub_dt,
+                        self.max_collision_pairs
+                    ],
+                    device=self.device
+                )
+                
+                # Apply collision constraint corrections
+                wp.launch(
+                    apply_and_clear_deltas,
+                    dim=(self.batch_size, self.num_particles),
+                    inputs=[
+                        self.positions,
                         self._delta_x,
                         self._delta_y,
                         self._delta_z,
@@ -1645,7 +1589,6 @@ class XPBDSimulator:
                     dim=(self.batch_size, self.num_fixed_constraints),
                     inputs=[
                         self.positions,
-                        time_step,
                         self.velocities,
                         self.fixed_positions,
                         self.fixed_indices,
@@ -1660,7 +1603,6 @@ class XPBDSimulator:
             dim=(self.batch_size, self.num_particles),
             inputs=[
                 self.positions,
-                time_step,
                 self.inv_masses,
                 self.ink_canvas,
                 self.canvas_resolution,
@@ -1680,8 +1622,6 @@ class XPBDSimulator:
             dim=(self.batch_size, self.num_particles),
             inputs=[
                 self.positions,
-                time_step,
-                self.displacement,
                 self.velocities,
                 self.inv_masses,
                 self.sub_dt,
@@ -1703,134 +1643,81 @@ class XPBDSimulator:
             device=self.device
         )
 
-    def get_ink_canvas_batch(self, batch_id: int = None):
-        if batch_id is None:
-            return wp.to_torch(self.ink_canvas)
-        else:
-            canvas_torch = wp.to_torch(self.ink_canvas)
-            return canvas_torch[batch_id]
+    def update_fixed_positions_from_transform(
+            self,
+            brush_center: torch.Tensor,
+            absolute_rotation: torch.Tensor
+    ):
+        """根据绝对位置和绝对旋转直接更新固定粒子位置
+        
+        Args:
+            brush_center: 笔杆中心的绝对位置，形状为 (3,) 或 (batch_size, 3)
+            absolute_rotation: 笔杆的绝对旋转四元数，形状为 (4,) 或 (batch_size, 4)
+                              格式为 (w, x, y, z)
+        """
+        if self.fixed_local_coords is None or self.num_fixed_constraints == 0:
+            return
 
-    def get_positions_batch(self, batch_id: int = None):
-        if batch_id is None:
-            return wp.to_torch(self.positions)
-        else:
-            pos_torch = wp.to_torch(self.positions)
-            return pos_torch[batch_id]
+        # 处理输入维度
+        if brush_center.dim() == 1:
+            brush_center = brush_center.unsqueeze(0).repeat(self.batch_size, 1)
+        if absolute_rotation.dim() == 1:
+            absolute_rotation = absolute_rotation.unsqueeze(0).repeat(self.batch_size, 1)
 
+        # 转换为设备上的张量
+        brush_center = brush_center.to(torch.float64).to(self.device)
+        absolute_rotation = absolute_rotation.to(torch.float64).to(self.device)
 
-def axis_angle_to_quaternion(axis: torch.Tensor, angle: torch.Tensor) -> torch.Tensor:
-    """将轴角表示转换为四元数
+        # 转换为 warp 数组
+        self.current_brush_center = wp.from_torch(brush_center, dtype=wp.vec3d)
+        self.current_absolute_rotation = wp.from_torch(absolute_rotation, dtype=wp.vec4d)
 
-    Args:
-        axis: 旋转轴，形状为 (..., 3)，会被自动归一化
-        angle: 旋转角度（弧度），形状为 (...) 或标量
+        # 使用 kernel 计算固定粒子的新位置
+        wp.launch(
+            apply_absolute_transform_to_fixed_positions,
+            dim=(self.batch_size, self.num_fixed_constraints),
+            inputs=[
+                self.fixed_positions,
+                self.fixed_local_coords,
+                self.current_brush_center,
+                self.current_absolute_rotation,
+                self.num_fixed_constraints
+            ],
+            device=self.device
+        )
 
-    Returns:
-        四元数，形状为 (..., 4)，格式为 (w, x, y, z)
-    """
-    # 归一化轴
-    axis = axis / (torch.norm(axis, dim=-1, keepdim=True) + 1e-12)
+        # 将固定粒子的位置应用到 now_position
+        wp.launch(
+            apply_prev_pos_to_now_pos,
+            dim=(self.batch_size, self.num_fixed_constraints),
+            inputs=[
+                self.positions,
+                self.fixed_positions,
+                self.fixed_indices,
+                self.inv_masses,
+                self.num_particles
+            ],
+            device=self.device
+        )
 
-    # 处理 angle 维度
-    if angle.dim() == 0:
-        angle = angle.unsqueeze(0)
-    if angle.dim() < axis.dim():
-        angle = angle.unsqueeze(-1)
+    def step_with_absolute_transform(
+            self,
+            brush_center: torch.Tensor,
+            absolute_rotation: torch.Tensor
+    ):
+        """使用绝对变换执行一步仿真
+        
+        与 step() 不同，此方法直接使用绝对位置和旋转来更新固定粒子，
+        而不是通过增量位移和旋转累积。
+        
+        Args:
+            brush_center: 笔杆中心的绝对位置，形状为 (3,) 或 (batch_size, 3)
+            absolute_rotation: 笔杆的绝对旋转四元数，形状为 (4,) 或 (batch_size, 4)
+                              格式为 (w, x, y, z)
+        """
+        # 直接更新固定粒子位置
+        self.update_fixed_positions_from_transform(brush_center, absolute_rotation)
 
-    half_angle = angle / 2.0
-    sin_half = torch.sin(half_angle)
-    cos_half = torch.cos(half_angle)
-
-    # 四元数格式: (w, x, y, z)
-    w = cos_half.squeeze(-1)
-    xyz = axis * sin_half
-
-    return torch.cat([w.unsqueeze(-1), xyz], dim=-1)
-
-
-def euler_to_quaternion(roll: torch.Tensor, pitch: torch.Tensor, yaw: torch.Tensor) -> torch.Tensor:
-    """将欧拉角转换为四元数 (ZYX 顺序)
-
-    Args:
-        roll: 绕 X 轴旋转角度（弧度）
-        pitch: 绕 Y 轴旋转角度（弧度）
-        yaw: 绕 Z 轴旋转角度（弧度）
-
-    Returns:
-        四元数，形状为 (..., 4)，格式为 (w, x, y, z)
-    """
-    cy = torch.cos(yaw * 0.5)
-    sy = torch.sin(yaw * 0.5)
-    cp = torch.cos(pitch * 0.5)
-    sp = torch.sin(pitch * 0.5)
-    cr = torch.cos(roll * 0.5)
-    sr = torch.sin(roll * 0.5)
-
-    w = cr * cp * cy + sr * sp * sy
-    x = sr * cp * cy - cr * sp * sy
-    y = cr * sp * cy + sr * cp * sy
-    z = cr * cp * sy - sr * sp * cy
-
-    return torch.stack([w, x, y, z], dim=-1)
-
-
-def identity_quaternion(batch_shape: tuple = (), dtype=torch.float64, device=None) -> torch.Tensor:
-    """创建单位四元数（无旋转）
-
-    Args:
-        batch_shape: 批次形状，如 (batch_size, num_steps)
-        dtype: 数据类型
-        device: 设备
-
-    Returns:
-        单位四元数，形状为 (*batch_shape, 4)，格式为 (w, x, y, z) = (1, 0, 0, 0)
-    """
-    shape = batch_shape + (4,)
-    quat = torch.zeros(shape, dtype=dtype, device=device)
-    quat[..., 0] = 1.0  # w = 1
-    return quat
-
-
-def create_rotation_sequence(
-        angles: torch.Tensor,
-        axis: torch.Tensor = None,
-        rotation_type: str = "axis_angle"
-) -> torch.Tensor:
-    """创建旋转四元数序列，用于毛笔笔杆旋转
-
-    Args:
-        angles: 旋转角度序列
-            - 如果 rotation_type == "axis_angle": 形状为 (num_steps,) 或 (batch_size, num_steps)
-            - 如果 rotation_type == "euler": 形状为 (num_steps, 3) 或 (batch_size, num_steps, 3)，
-              分别表示 (roll, pitch, yaw)
-        axis: 旋转轴，仅用于 axis_angle 模式，形状为 (3,)
-              默认为 [0, 0, 1]（绕 Z 轴旋转）
-        rotation_type: "axis_angle" 或 "euler"
-
-    Returns:
-        增量旋转四元数序列，形状为 (num_steps, 4) 或 (batch_size, num_steps, 4)
-        格式为 (w, x, y, z)
-    """
-    if rotation_type == "axis_angle":
-        if axis is None:
-            axis = torch.tensor([0.0, 0.0, 1.0], dtype=angles.dtype, device=angles.device)
-
-        if angles.dim() == 1:
-            # (num_steps,) -> (num_steps, 4)
-            axis_expanded = axis.unsqueeze(0).expand(angles.shape[0], -1)
-            return axis_angle_to_quaternion(axis_expanded, angles)
-        else:
-            # (batch_size, num_steps) -> (batch_size, num_steps, 4)
-            axis_expanded = axis.unsqueeze(0).unsqueeze(0).expand(angles.shape[0], angles.shape[1], -1)
-            return axis_angle_to_quaternion(axis_expanded, angles.unsqueeze(-1).expand(-1, -1, 3)[..., 0])
-
-    elif rotation_type == "euler":
-        if angles.dim() == 2:
-            # (num_steps, 3)
-            return euler_to_quaternion(angles[:, 0], angles[:, 1], angles[:, 2])
-        else:
-            # (batch_size, num_steps, 3)
-            return euler_to_quaternion(angles[..., 0], angles[..., 1], angles[..., 2])
-
-    else:
-        raise ValueError(f"Unknown rotation_type: {rotation_type}")
+        # 执行物理仿真子步骤
+        for j in range(self.substeps):
+            self._substep()
