@@ -39,14 +39,24 @@ class BendingConstraint:
         self.rest_distance = rest_distance  # a到c的直线距离
 
 class AlignmentConstraint:
-    """对齐约束 - 使非固定粒子趋向于两固定粒子构成的直线
+    """对齐约束 - 使非固定粒子趋向于两固定粒子构成的直线或锥形收拢位置
+    
+    根据粒子是否被压在纸面上，动态选择目标位置：
+    - 未被压在纸面：收拢成锥形（使用 cone_target_ratio 和 initial_radial_offset）
+    - 被压在纸面：向固定粒子延长线位置移动（使用 rest_ratio）
     """
-    def __init__(self, point_fixed_start, point_fixed_end, point_free, rest_ratio, relative_location=0.0):
+    def __init__(self, point_fixed_start, point_fixed_end, point_free, rest_ratio, relative_location=0.0, 
+                 cone_target_ratio=None, initial_radial_offset=None):
         self.point_fixed_start = point_fixed_start
         self.point_fixed_end = point_fixed_end
         self.point_free = point_free
-        self.rest_ratio = rest_ratio # 初始状态下, free点到fixed_start点的距离比例 (离fixed_start的距离 / |start-end|)
+        self.rest_ratio = rest_ratio  # 延长线目标：free点到fixed_start点的距离比例 (离fixed_start的距离 / |start-end|)
         self.relative_location = relative_location  # 粒子在毛发上的相对位置 (0.0=根部固定区域结束点, 1.0=尖端)
+        # 锥形目标：粒子在锥形上的位置比例，None 表示使用 rest_ratio
+        self.cone_target_ratio = cone_target_ratio if cone_target_ratio is not None else rest_ratio
+        # 初始径向偏移：毛发相对于笔心中心轴的偏移向量 (x, y, z)
+        # 用于计算锥形目标位置
+        self.initial_radial_offset = initial_radial_offset if initial_radial_offset is not None else (0.0, 0.0, 0.0)
 
 
 class CollisionConstraint:

@@ -392,15 +392,29 @@ def solve_alignment_constraints(
         inv_masses: wp.array(dtype=wp.float64, ndim=2),
         constraint_indices: wp.array(dtype=wp.vec3i),
         rest_ratios: wp.array(dtype=wp.float64),
+        cone_ratios: wp.array(dtype=wp.float64),
+        radial_offsets: wp.array(dtype=wp.vec3d),
         compliances: wp.array(dtype=wp.float64),
         lagrange_multipliers: wp.array(dtype=wp.float64),
         deltas_x: wp.array(dtype=wp.float64, ndim=2),
         deltas_y: wp.array(dtype=wp.float64, ndim=2),
         deltas_z: wp.array(dtype=wp.float64, ndim=2),
         dt: wp.float64,
-        num_constraints: int
+        num_constraints: int,
+        plane_z: wp.float64
 ):
-    """对齐约束求解器。固定使用 time_step=1 (now_position)"""
+    """对齐约束求解器。
+    
+    根据延长线目标点穿透纸面的比例动态选择目标位置：
+    - 延长线目标点在纸面上方：使用锥形目标（收拢）
+    - 延长线目标点穿透纸面：根据穿透比例混合锥形和延长线目标
+    
+    投影方式：
+    - 延长线目标：沿延长线方向投影到纸面，保持到延长线与纸面交点的距离
+    - 锥形目标：投影到纸面后，保持到锥形中心轴与纸面交点的距离，实现自然收拢
+    
+    固定使用 time_step=1 (now_position)
+    """
     batch_id, tid = wp.tid()
     if tid >= num_constraints:
         return
@@ -409,7 +423,6 @@ def solve_alignment_constraints(
     i, j, k = idx[0], idx[1], idx[2]
 
     # Get positions: i, j are fixed (start, end), k is free
-    # 固定使用 time_step=1 (now_position)
     p_start = positions[batch_id, 1, i]
     p_end = positions[batch_id, 1, j]
     p_free = positions[batch_id, 1, k]
@@ -422,48 +435,161 @@ def solve_alignment_constraints(
     if axis_sq < eps:
         return
 
-    # New projection definition: Use stored ratio to determine target position along the line
-    ratio = rest_ratios[tid]
+    # 获取参数
+    ratio = rest_ratios[tid]  # 沿 axis 方向的比例（相对于 p_start 到 p_end 的距离）
+    cone_shrink = cone_ratios[tid]  # 锥形收缩系数: 1.0 (根部) -> 0.0 (尖端)
+    initial_radial = radial_offsets[tid]  # 毛发的初始径向偏移 (x, y, 0)
 
-    # Calculate target position
-    p_proj = p_start + axis * ratio
+    limit_plane_z = plane_z
+    axis_len = wp.sqrt(axis_sq)
 
-    limit_plane_z = wp.float64(0.25)
-    if p_proj[2] < limit_plane_z:
+    # 计算延长线目标点（沿 axis 方向延伸）
+    p_line_target = p_start + axis * ratio
+    
+    # 锥形目标点：从延长线目标减去部分径向偏移，使粒子向中心轴收拢
+    # - 根部 (cone_shrink = 1.0): p_cone_target = p_line_target（保持在延长线上）
+    # - 尖端 (cone_shrink = 0.0): p_cone_target = p_line_target - initial_radial（收拢到中心轴）
+    p_cone_target = p_line_target - initial_radial * (wp.float64(1.0) - cone_shrink)
+    
+    # 计算锥形中心轴目标点（不带径向偏移）
+    p_center_axis_target = p_line_target - initial_radial
+
+    # 计算延长线与纸面的交点，以及穿透比例
+    blend_weight = wp.float64(0.0)  # 默认使用锥形目标
+    
+    # 计算延长线与纸面的交点（用于延长线目标的投影）
+    p_line_intersection = p_line_target  # 默认值
+    # 计算中心轴与纸面的交点（用于锥形目标的投影）
+    p_cone_axis_intersection = p_center_axis_target  # 默认值
+    
+    if wp.abs(axis[2]) > eps:
+        t_line_int = (limit_plane_z - p_start[2]) / axis[2]
+        p_line_intersection = p_start + axis * t_line_int
+        # 中心轴的起点是 p_start - initial_radial，方向与 axis 相同
+        p_center_start = p_start - initial_radial
+        t_cone_int = (limit_plane_z - p_center_start[2]) / axis[2]
+        p_cone_axis_intersection = p_center_start + axis * t_cone_int
+    
+    if p_line_target[2] < limit_plane_z:
+        # 延长线目标点在纸面下方，需要计算穿透比例
         if wp.abs(axis[2]) > eps:
-            t_int = (limit_plane_z - p_start[2]) / axis[2]
-            p_int = p_start + axis * t_int
-
-            # distance between original projected point and intersection
-            dist_p_i = wp.length(p_proj - p_int)
-
-            # direction from intersection to projected point in xy plane
-            dir_x = p_proj[0] - p_int[0]
-            dir_y = p_proj[1] - p_int[1]
-            mag_xy = wp.sqrt(dir_x * dir_x + dir_y * dir_y)
-
-            if mag_xy > eps:
-                scale = dist_p_i / mag_xy
-                p_proj = wp.vec3d(p_int[0] + dir_x * scale, p_int[1] + dir_y * scale, limit_plane_z)
+            # 计算穿透深度：交点到目标点的距离
+            penetration_vec = p_line_target - p_line_intersection
+            penetration_depth = wp.length(penetration_vec)
+            
+            # 计算毛发自由部分的总长度
+            free_part_length = (ratio - wp.float64(1.0)) * axis_len
+            
+            # 计算穿透比例
+            if free_part_length > eps:
+                penetration_ratio = penetration_depth / free_part_length
+                penetration_ratio = wp.clamp(penetration_ratio, wp.float64(0.0), wp.float64(1.0))
+                blend_weight = penetration_ratio
             else:
-                p_proj = p_int
+                blend_weight = wp.float64(1.0)
+        else:
+            blend_weight = wp.float64(1.0)
 
-        # Distance vector from projection to free point
-        diff = (p_free - p_proj) * wp.float64(1.2)
-        dist = wp.length(diff)
-    else:
-        # Distance vector from projection to free point
-        diff = p_free - p_proj
+    # 分别计算锥形目标和延长线目标的投影
+    p_cone_proj = p_cone_target
+    p_line_proj = p_line_target
+    
+    # 锥形目标投影：保持垂直于（中心轴与z轴平面）的分量不变，拉伸平行分量以保持总长度
+    if p_cone_target[2] < limit_plane_z:
+        # 计算锥形目标到中心轴交点的向量
+        cone_to_axis_int = p_cone_target - p_cone_axis_intersection
+        dist_to_axis_int = wp.length(cone_to_axis_int)
+        
+        if dist_to_axis_int > eps:
+            # 计算中心轴在xy平面上的投影（平行于中心轴与z轴平面的方向）
+            axis_xy = wp.vec3d(axis[0], axis[1], wp.float64(0.0))
+            axis_xy_len = wp.length(axis_xy)
+            
+            if axis_xy_len > eps:
+                # 平行于（中心轴与z轴平面）且在xy平面内的单位向量
+                t_xy = axis_xy / axis_xy_len
+                # 垂直于（中心轴与z轴平面）且在xy平面内的单位向量
+                n_xy = wp.vec3d(axis[1] / axis_xy_len, -axis[0] / axis_xy_len, wp.float64(0.0))
+                
+                # 计算原始向量在两个方向上的分量
+                comp_n = wp.dot(cone_to_axis_int, n_xy)  # 垂直于平面的分量（保持不变）
+                comp_t_original = wp.dot(cone_to_axis_int, t_xy)  # 平行于平面的分量（需要调整）
+                
+                # 计算需要的平行分量大小，以保持总长度不变
+                # |v_proj|² = comp_n² + comp_t_new² = dist_to_axis_int²
+                comp_t_sq_needed = dist_to_axis_int * dist_to_axis_int - comp_n * comp_n
+                
+                if comp_t_sq_needed > wp.float64(0.0):
+                    # 保持原始分量的符号
+                    comp_t_sign = wp.float64(1.0)
+                    if comp_t_original < wp.float64(0.0):
+                        comp_t_sign = wp.float64(-1.0)
+                    comp_t_new = wp.sqrt(comp_t_sq_needed) * comp_t_sign
+                    
+                    # 构建投影向量（在xy平面上）
+                    proj_vec = n_xy * comp_n + t_xy * comp_t_new
+                    p_cone_proj = p_cone_axis_intersection + proj_vec
+                    p_cone_proj = wp.vec3d(p_cone_proj[0], p_cone_proj[1], limit_plane_z)
+                else:
+                    # comp_n 已经大于等于总长度，只保留垂直分量
+                    proj_vec = n_xy * comp_n
+                    p_cone_proj = p_cone_axis_intersection + proj_vec
+                    p_cone_proj = wp.vec3d(p_cone_proj[0], p_cone_proj[1], limit_plane_z)
+            else:
+                # 中心轴与z轴平行，直接使用xy平面投影并保持距离
+                dir_xy = wp.vec3d(cone_to_axis_int[0], cone_to_axis_int[1], wp.float64(0.0))
+                dir_xy_len = wp.length(dir_xy)
+                if dir_xy_len > eps:
+                    dir_xy_norm = dir_xy / dir_xy_len
+                    p_cone_proj = p_cone_axis_intersection + dir_xy_norm * dist_to_axis_int
+                    p_cone_proj = wp.vec3d(p_cone_proj[0], p_cone_proj[1], limit_plane_z)
+                else:
+                    p_cone_proj = wp.vec3d(p_cone_axis_intersection[0], p_cone_axis_intersection[1], limit_plane_z)
+        else:
+            p_cone_proj = wp.vec3d(p_cone_axis_intersection[0], p_cone_axis_intersection[1], limit_plane_z)
+    
+    # 延长线目标投影：沿延长线方向投影，保持到延长线交点的距离
+    if p_line_target[2] < limit_plane_z:
+        # 计算延长线目标到延长线交点的距离
+        line_to_int = p_line_target - p_line_intersection
+        dist_to_line_int = wp.length(line_to_int)
+        
+        if dist_to_line_int > eps:
+            # 计算方向（在 xy 平面上）
+            dir_xy = wp.vec3d(line_to_int[0], line_to_int[1], wp.float64(0.0))
+            dir_xy_len = wp.length(dir_xy)
+            if dir_xy_len > eps:
+                dir_xy_norm = dir_xy / dir_xy_len
+                p_line_proj = p_line_intersection + dir_xy_norm * dist_to_line_int
+                p_line_proj = wp.vec3d(p_line_proj[0], p_line_proj[1], limit_plane_z)
+            else:
+                p_line_proj = wp.vec3d(p_line_intersection[0], p_line_intersection[1], limit_plane_z)
+        else:
+            p_line_proj = wp.vec3d(p_line_intersection[0], p_line_intersection[1], limit_plane_z)
+
+    # 根据混合权重计算最终目标点
+    # blend_weight = 0: 完全锥形
+    # blend_weight = 1: 完全延长线
+
+    blend_weight = blend_weight * wp.float64(0.8)  # 调整混合权重，减少延长线目标的影响，增强收拢效果
+
+    p_proj = p_cone_proj * (wp.float64(1.0) - blend_weight) + p_line_proj * blend_weight
+    # p_proj = p_cone_proj
+
+    # 计算修正
+    diff = p_free - p_proj
+    dist = wp.length(diff)
+    
+    # 如果目标在纸面下方，增加修正强度
+    if p_proj[2] <= limit_plane_z + eps:
+        diff = diff * wp.float64(1.0)
         dist = wp.length(diff)
 
     if dist < eps:
         return
 
-    # Direction of correction (pulling free particle towards line)
     n = diff / dist
-
     w_free = inv_masses[batch_id, k]
-    # For fixed particles, inv_mass is zero, so we only consider w_free
     w_sum = w_free
 
     if w_sum < eps:
@@ -471,15 +597,10 @@ def solve_alignment_constraints(
 
     alpha = compliances[tid] / (dt * dt)
     denom = w_sum + alpha
-
-    # Delta lambda
     delta_lambda = -(dist + alpha * lagrange_multipliers[tid]) / denom
     lagrange_multipliers[tid] = lagrange_multipliers[tid] + delta_lambda
-
-    # Correction
     correction = delta_lambda * n * w_free
 
-    # We only update the free particle
     wp.atomic_add(deltas_x, batch_id, k, correction[0])
     wp.atomic_add(deltas_y, batch_id, k, correction[1])
     wp.atomic_add(deltas_z, batch_id, k, correction[2])
@@ -521,8 +642,10 @@ def solve_plane_constraints(
         deltas_z: wp.array(dtype=wp.float64, ndim=2),
         dt: wp.float64,
         num_particles: int,
+        static_friction: wp.float64,
+        dynamic_friction: wp.float64,
 ):
-    """平面约束求解器。固定使用 time_step=1 (now_position)"""
+    """平面约束求解器（带静摩擦与动摩擦）。固定使用 time_step=1 (now_position)"""
     batch_id, tid = wp.tid()
     if tid >= num_particles:
         return
@@ -530,8 +653,9 @@ def solve_plane_constraints(
     if inv_masses[batch_id, tid] <= wp.float64(0.0):  # Fixed particles
         return
 
-    # 固定使用 time_step=1 (now_position)
+    # 固定使用 time_step=1 (now_position), time_step=0 为 prev_position
     pos = positions[batch_id, 1, tid]
+    prev_pos = positions[batch_id, 0, tid]
 
     # Check against all planes
     plane_idx = 0
@@ -570,18 +694,53 @@ def solve_plane_constraints(
         # Update lagrange multiplier
         lagrange_multipliers[batch_id, lambda_idx] = lagrange_multipliers[batch_id, lambda_idx] + delta_lambda
 
-        # Apply position correction
-        correction = inv_masses[batch_id, tid] * delta_lambda * grad
+        # Apply normal position correction (穿透修正)
+        normal_correction = inv_masses[batch_id, tid] * delta_lambda * grad
 
         # Limit correction magnitude
-        correction_magnitude = wp.length(correction)
+        correction_magnitude = wp.length(normal_correction)
         if correction_magnitude > max_correction:
-            correction = correction * (max_correction / correction_magnitude)
+            normal_correction = normal_correction * (max_correction / correction_magnitude)
+
+        # ============== 摩擦力计算 ==============
+        # 计算切向位移 (tangential displacement)
+        displacement = pos - prev_pos
+        # 法向分量
+        normal_disp = wp.dot(displacement, normal) * normal
+        # 切向分量
+        tangent_disp = displacement - normal_disp
+        tangent_disp_magnitude = wp.length(tangent_disp)
+
+        # 法向力大小 (用 delta_lambda 近似, 正值表示推出平面的力)
+        normal_force_magnitude = wp.abs(delta_lambda)
+
+        # 摩擦力修正
+        friction_correction = wp.vec3d(wp.float64(0.0), wp.float64(0.0), wp.float64(0.0))
+
+        if tangent_disp_magnitude > wp.float64(1e-10):
+            # 切向单位向量 (指向运动方向的反方向即为摩擦力方向)
+            tangent_dir = tangent_disp / tangent_disp_magnitude
+
+            # 静摩擦阈值：如果切向位移小于静摩擦能承受的最大值，则完全阻止滑动
+            static_friction_max = static_friction * normal_force_magnitude
+
+            if tangent_disp_magnitude <= static_friction_max:
+                # 静摩擦：完全抵消切向位移
+                friction_correction = -tangent_disp
+            else:
+                # 动摩擦：施加与法向力成比例的摩擦力
+                dynamic_friction_force = dynamic_friction * normal_force_magnitude
+                # 摩擦力不能超过切向位移量
+                friction_amount = wp.min(dynamic_friction_force, tangent_disp_magnitude)
+                friction_correction = -tangent_dir * friction_amount
+
+        # 总修正 = 法向修正 + 摩擦修正
+        total_correction = normal_correction + friction_correction
 
         # Accumulate corrections atomically
-        wp.atomic_add(deltas_x, batch_id, tid, correction[0])
-        wp.atomic_add(deltas_y, batch_id, tid, correction[1])
-        wp.atomic_add(deltas_z, batch_id, tid, correction[2])
+        wp.atomic_add(deltas_x, batch_id, tid, total_correction[0])
+        wp.atomic_add(deltas_y, batch_id, tid, total_correction[1])
+        wp.atomic_add(deltas_z, batch_id, tid, total_correction[2])
 
 
 @wp.kernel
@@ -837,6 +996,8 @@ class XPBDSimulator:
                  collision_compliance: float = 1e-6,  # 碰撞约束的柔度
                  enable_collision: bool = True,  # 是否启用碰撞检测
                  max_collision_pairs: int = 10000,  # 每个batch最大碰撞对数量
+                 plane_static_friction: float = 0.5,  # 平面静摩擦系数
+                 plane_dynamic_friction: float = 0.3,  # 平面动摩擦系数
                  canvas_min_x: float = 0.0,
                  canvas_max_x: float = 1.0,
                  canvas_min_y: float = 0.0,
@@ -861,6 +1022,8 @@ class XPBDSimulator:
         self.collision_compliance = collision_compliance
         self.enable_collision = enable_collision
         self.max_collision_pairs = max_collision_pairs
+        self.plane_static_friction = plane_static_friction
+        self.plane_dynamic_friction = plane_dynamic_friction
         self.damping = damping
         self.restitution = restitution
         self.friction = friction
@@ -1137,6 +1300,8 @@ class XPBDSimulator:
                 j = constraint.point_fixed_end.particle_id
                 k = constraint.point_free.particle_id
                 ratio = constraint.rest_ratio
+                cone_ratio = constraint.cone_target_ratio
+                radial_offset = constraint.initial_radial_offset
 
                 # 计算 variable compliance
                 # relative_location: 0.0 (near root) -> 1.0 (tip)
@@ -1144,7 +1309,7 @@ class XPBDSimulator:
                 t = constraint.relative_location
                 compliance = comp_start + (comp_end - comp_start) * t
 
-                alignment_data.append((i, j, k, ratio, compliance))
+                alignment_data.append((i, j, k, ratio, compliance, cone_ratio, radial_offset))
 
         # Create distance constraint arrays using torch
         if distance_data:
@@ -1199,11 +1364,15 @@ class XPBDSimulator:
             ali_indices = torch.tensor([(d[0], d[1], d[2]) for d in alignment_data], dtype=torch.int32).to(self.device)
             ali_ratios = torch.tensor([d[3] for d in alignment_data], dtype=torch.float64).to(self.device)
             ali_compliances = torch.tensor([d[4] for d in alignment_data], dtype=torch.float64).to(self.device)
+            ali_cone_ratios = torch.tensor([d[5] for d in alignment_data], dtype=torch.float64).to(self.device)
+            ali_radial_offsets = torch.tensor([d[6] for d in alignment_data], dtype=torch.float64).to(self.device)
             ali_lambdas = torch.zeros(num_ali, dtype=torch.float64).to(self.device)
 
             self.alignment_indices = wp.from_torch(ali_indices, dtype=wp.vec3i)
             self.alignment_rest_ratios = wp.from_torch(ali_ratios, dtype=wp.float64)
             self.alignment_compliances = wp.from_torch(ali_compliances, dtype=wp.float64)
+            self.alignment_cone_ratios = wp.from_torch(ali_cone_ratios, dtype=wp.float64)
+            self.alignment_radial_offsets = wp.from_torch(ali_radial_offsets, dtype=wp.vec3d)
             self.alignment_lambdas = wp.from_torch(ali_lambdas, dtype=wp.float64)
             self.num_alignment_constraints = num_ali
 
@@ -1463,13 +1632,16 @@ class XPBDSimulator:
                         self.inv_masses,
                         self.alignment_indices,
                         self.alignment_rest_ratios,
+                        self.alignment_cone_ratios,
+                        self.alignment_radial_offsets,
                         self.alignment_compliances,
                         self.alignment_lambdas,
                         self._delta_x,
                         self._delta_y,
                         self._delta_z,
                         self.sub_dt,
-                        self.num_alignment_constraints
+                        self.num_alignment_constraints,
+                        PLANE_Z
                     ],
                     device=self.device
                 )
@@ -1490,7 +1662,6 @@ class XPBDSimulator:
 
             # Solve plane constraints (z=0 plane penetration prevention)
             if self.plane_normals is not None and self.num_planes > 0:
-                pass
                 wp.launch(
                     solve_plane_constraints,
                     dim=(self.batch_size, self.num_particles),
@@ -1506,6 +1677,8 @@ class XPBDSimulator:
                         self._delta_z,
                         self.sub_dt,
                         self.num_particles,
+                        wp.float64(self.plane_static_friction),
+                        wp.float64(self.plane_dynamic_friction),
                     ],
                     device=self.device
                 )

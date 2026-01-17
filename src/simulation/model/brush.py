@@ -161,8 +161,8 @@ class Brush:
             current_angle = random() * 2 * torch.pi
             x = current_radius * torch.cos(torch.tensor(current_angle, dtype=torch.float64)).item()
             y = current_radius * torch.sin(torch.tensor(current_angle, dtype=torch.float64)).item()
-            length = self.max_length * (1 - (current_radius / self.radius)) * self.length_ratio + self.max_length * (
-                        1 - self.length_ratio)
+            # 所有毛发都是相同的 max_length 长度
+            length = self.max_length
 
             flexibility = (1 - (current_radius / self.radius)) * 0.5 + 0.5
             hair = Hair(length, flexibility, self.thickness,
@@ -186,17 +186,28 @@ class Brush:
                 start_idx = hair.particles.index(p_end) + 1
                 num_free_particles = len(hair.particles) - start_idx
                 
+                # 计算毛发根部在 xy 平面上的偏移量（这是毛发相对于笔心中心轴的径向偏移）
+                # 在竖直坐标系下，x, y 就是径向偏移
+                initial_radial_offset = (x, y, 0.0)
+                
                 for k in range(start_idx, len(hair.particles)):
+                    # 原有的延长线目标比例
                     dist_start_free = torch.norm(hair.particles[k].position - p_start.position).item()
-                    ratio = dist_start_free / dist_start_end
+                    rest_ratio = dist_start_free / dist_start_end
                     
                     # Calculate relative location (0.0 at root-end/free-start, 1.0 at tip)
                     if num_free_particles > 1:
                         relative_loc = (k - start_idx) / (num_free_particles - 1)
                     else:
                         relative_loc = 1.0
+                    
+                    # 锥形收拢系数: 从 1.0 (根部) 到 0.0 (尖端)
+                    cone_shrink = 1.0 - relative_loc
                         
-                    self.constraints.append(AlignmentConstraint(p_start, p_end, hair.particles[k], ratio, relative_loc))
+                    self.constraints.append(AlignmentConstraint(
+                        p_start, p_end, hair.particles[k], rest_ratio, relative_loc, 
+                        cone_shrink, initial_radial_offset
+                    ))
 
             self.hairs.append(hair)
             hair.gen_constraints()

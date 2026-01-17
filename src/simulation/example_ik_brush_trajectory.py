@@ -143,8 +143,8 @@ def load_font_data(data_root: str) -> tuple:
     common_keys = sorted(list(set(strokes_data.keys()) & set(images_data.keys())))
     import random
     char_key = random.choice(common_keys)
-    char_key = "下载 (1)"
-    # char_key = "debug"
+    # char_key = "下载 (1)"
+    char_key = "debug"
     # 解码图像
     img_bytes = images_data[char_key]
     image = Image.open(io.BytesIO(img_bytes)).convert('RGB')
@@ -230,10 +230,7 @@ def compute_brush_depth_from_radius(target_radius: float,
     term2 = target_radius * math.sqrt(term_inside_sqrt)
 
     d = term1 - term2 * MAGIC_NUMBER_K + (brush_max_length - H) + brush_max_length / (
-                WRITING_WORLD_SIZE * 2) * MAGIC_NUMBER_B  # 最后一个数字是经验参数
-
-    # 计算下压深度：d = r * max_length * length_ratio / radius
-    # depth = target_radius * brush_max_length * brush_length_ratio / brush_radius
+                WRITING_WORLD_SIZE * 2) * MAGIC_NUMBER_B
 
     return d
 
@@ -551,8 +548,8 @@ class Example:
         possible_data_roots = [
             "/data1/jizy/output/infer_output",
             "/home/jizy/project/video_tokenizer/data/test/debug",
-            "../../data/infer_output_zhao",
             "../../data/debug",
+            "../../data/infer_output_zhao",
             "../../data/infer_output_ou",
             "../../data/infer_output",
             "/data1/jizy/font_out/FZSJSJW",  # predict_traj/data
@@ -1449,7 +1446,7 @@ class Example:
             dis_compliance=1e-8,
             variable_dis_compliance=1e-8,
             bending_compliance=1e-5,
-            alignment_compliance_range=(1e-4, 1e-5),
+            alignment_compliance_range=(1e-5, 1e-5),
             damping=0.3,
             canvas_resolution=256,
             canvas_min_x=min_x,

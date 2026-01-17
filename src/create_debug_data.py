@@ -28,13 +28,13 @@ def create_debug_data():
     num_points = 48
     
     # 第一个维度从-1均匀变化到1
-    dim0 = np.linspace(-1, 1, num_points)
+    dim0 = np.linspace(-1, 0, num_points)
     
     # 第二个维度保持为0
     dim1 = np.zeros(num_points)
     
     # 第三个维度从-1均匀变化到1
-    dim2 = np.linspace(-1, 1, num_points)
+    dim2 = np.linspace(-1, 0, num_points)
     
     # 堆叠成 (48, 3) 的形状
     # 使用 float32 是常见做法，如果需要 float64 可以去掉 .astype
