@@ -14,15 +14,18 @@ import time
 OUTPUT_DIR_BASE = "/home/jizy/project/video_tokenizer/src/simulation/render/output_frames"
 RESOLUTION = (1280, 720)
 USE_GPU = True
-# 并行进程数 - 根据GPU内存占用20%计算，可同时运行5个进程
-NUM_PARALLEL_PROCESSES = 5
 
-# GPU分配锁，用于线程安全地分配GPU
+NUM_PARALLEL_PROCESSES = 30
+
 gpu_lock = threading.Lock()
 
+ESTIMATED_MEM_PER_PROCESS = 3 * 1024 
 
 def get_gpu_memory_info():
-    """获取所有GPU的显存使用情况，返回按空闲显存排序的GPU列表"""
+    """
+    获取所有GPU的显存使用情况。
+    返回一个列表，包含每个GPU的字典信息，初始按空闲显存降序排序。
+    """
     try:
         # 使用nvidia-smi查询GPU显存信息
         result = subprocess.run(
@@ -47,7 +50,7 @@ def get_gpu_memory_info():
                         'free': int(parts[3])
                     })
         
-        # 按空闲显存降序排序（空闲越多越优先）
+        # 初始按空闲显存降序排序（空闲越多越优先）
         gpu_info.sort(key=lambda x: x['free'], reverse=True)
         return gpu_info
         
@@ -60,38 +63,59 @@ def get_gpu_memory_info():
 
 
 def select_best_gpu():
-    """选择当前显存最空闲的GPU"""
+    """
+    选择当前显存最空闲的GPU (单次查询)
+    """
     with gpu_lock:
         gpu_info = get_gpu_memory_info()
         if gpu_info:
             best_gpu = gpu_info[0]
-            print(f"   Selected GPU {best_gpu['index']} (Free: {best_gpu['free']}MB / Total: {best_gpu['total']}MB)")
+            print(f"Selected GPU {best_gpu['index']} (Free: {best_gpu['free']}MB / Total: {best_gpu['total']}MB)")
             return best_gpu['index']
         return 0
 
 
-def get_available_gpus():
-    """获取所有可用GPU列表，按空闲显存排序"""
-    gpu_info = get_gpu_memory_info()
-    return [g['index'] for g in gpu_info]
-
-
 def assign_gpus_to_workers(num_workers):
-    """为所有worker预分配GPU，使用轮询方式均匀分配"""
-    gpu_info = get_gpu_memory_info()
-    if not gpu_info:
-        return [0] * num_workers
-    
-    # 按空闲显存排序的GPU列表
-    available_gpus = [g['index'] for g in gpu_info]
-    
-    # 轮询分配GPU给每个worker
-    assignments = []
-    for i in range(num_workers):
-        gpu_idx = available_gpus[i % len(available_gpus)]
-        assignments.append(gpu_idx)
-    
-    return assignments
+    """
+    为一批 worker 分配 GPU。
+    策略：贪心算法 + 模拟扣除。
+    每分配一个 worker，就将该 GPU 的空闲显存减去 ESTIMATED_MEM_PER_PROCESS，
+    确保下一个 worker 能分配到更新后最空闲的 GPU。
+    """
+    with gpu_lock:
+        # 1. 获取当前真实的 GPU 状态快照
+        # 注意：这里我们获取的是一个副本，修改它不会影响真实硬件，只用于本次分配计算
+        gpu_info = get_gpu_memory_info()
+        
+        if not gpu_info:
+            print("No GPU info available, assigning all to GPU 0")
+            return [0] * num_workers
+        
+        assignments = []
+        
+        print(f"\n--- 开始分配 GPU (共 {num_workers} 个任务, 单任务预估: {ESTIMATED_MEM_PER_PROCESS}MB) ---")
+
+        for i in range(num_workers):
+            # 2. 核心逻辑：每次分配前，根据当前'模拟'的剩余显存重新排序
+            # key: free (降序)，如果 free 相同，则按 index (升序) 保证确定性
+            gpu_info.sort(key=lambda x: (x['free'], -x['index']), reverse=True)
+            
+            # 3. 选择当前最空闲的 GPU (排序后的第一个)
+            best_gpu = gpu_info[0]
+            
+            # 4. 记录分配结果
+            assignments.append(best_gpu['index'])
+            
+            # 5. 【关键修改】模拟扣除显存
+            # 这样下一次循环时，这个 GPU 的 free 值会减少，可能不再是排第一了
+            prev_free = best_gpu['free']
+            best_gpu['free'] -= ESTIMATED_MEM_PER_PROCESS
+            
+            print(f"任务 {i+1}: 分配给 GPU {best_gpu['index']} "
+                  f"(原空闲: {prev_free}MB -> 模拟剩余: {best_gpu['free']}MB)")
+        
+        print("--- 分配完成 ---\n")
+        return assignments
 
 
 def print_gpu_status():
@@ -569,6 +593,8 @@ def setup_scene(args):
     # 2. 应用材质到指定层级
     # 将 brush_particles_instance 下所有物体设为黑色
     apply_material_recursive("brush_particles_instance", mat_black)
+
+    apply_material_recursive("ink_trail_instance", mat_black)
     
     # 将 stick_instance 下所有物体设为棕色
     apply_material_recursive("stick_instance", mat_brown)
@@ -732,7 +758,7 @@ def setup_scene(args):
         cam_data = bpy.data.cameras.new("Camera")
         cam_obj = bpy.data.objects.new("Camera", cam_data)
         scene.collection.objects.link(cam_obj)
-        k = 0.7
+        k = 0.5
         cam_obj.location = (2.8342 * k, 1.9493 * k, 2.5283 * k)
         cam_obj.rotation_euler = (math.radians(54.959), 0, math.radians(125.89))
         scene.camera = cam_obj

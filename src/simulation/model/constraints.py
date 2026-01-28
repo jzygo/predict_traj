@@ -31,12 +31,18 @@ class BendingConstraint:
     对于三个连续粒子 a, b, c，约束 a 和 c 之间的距离
     等于 |a-b| + |b-c|（即直线时的距离）
     这比角度约束更加数值稳定
+    
+    对于毛笔毛发仿真：
+    - relative_location 表示约束在毛发上的相对位置 (0.0=根部, 1.0=尖端)
+    - 根部 compliance 较小（硬），保持笔头形状稳定
+    - 尖端 compliance 较大（软），允许自然弯曲和飘逸效果
     """
-    def __init__(self, point_a, point_b, point_c, rest_distance):
+    def __init__(self, point_a, point_b, point_c, rest_distance, relative_location=0.0):
         self.point_a = point_a  # 第一个端点
         self.point_b = point_b  # 中间点
         self.point_c = point_c  # 第二个端点
         self.rest_distance = rest_distance  # a到c的直线距离
+        self.relative_location = relative_location  # 在毛发上的相对位置 (0.0=根部, 1.0=尖端)
 
 class AlignmentConstraint:
     """对齐约束 - 使非固定粒子趋向于两固定粒子构成的直线或锥形收拢位置

@@ -6,10 +6,11 @@
   <component name="ChangeListManager">
     <list default="true" id="983d1f42-2c94-4bb0-b5f1-83b179f29dfc" name="更改" comment="修正效果">
       <change beforePath="$PROJECT_DIR$/.idea/workspace.xml" beforeDir="false" afterPath="$PROJECT_DIR$/.idea/workspace.xml" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/src/create_debug_data.py" beforeDir="false" afterPath="$PROJECT_DIR$/src/create_debug_data.py" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/src/simulation/config.py" beforeDir="false" afterPath="$PROJECT_DIR$/src/simulation/config.py" afterDir="false" />
       <change beforePath="$PROJECT_DIR$/src/simulation/example_ik_brush_trajectory.py" beforeDir="false" afterPath="$PROJECT_DIR$/src/simulation/example_ik_brush_trajectory.py" afterDir="false" />
       <change beforePath="$PROJECT_DIR$/src/simulation/model/brush.py" beforeDir="false" afterPath="$PROJECT_DIR$/src/simulation/model/brush.py" afterDir="false" />
       <change beforePath="$PROJECT_DIR$/src/simulation/model/constraints.py" beforeDir="false" afterPath="$PROJECT_DIR$/src/simulation/model/constraints.py" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/src/simulation/render/render_usd_to_video.py" beforeDir="false" afterPath="$PROJECT_DIR$/src/simulation/render/render_usd_to_video.py" afterDir="false" />
       <change beforePath="$PROJECT_DIR$/src/simulation/xpbd_warp_diff.py" beforeDir="false" afterPath="$PROJECT_DIR$/src/simulation/xpbd_warp_diff.py" afterDir="false" />
     </list>
     <option name="SHOW_DIALOG" value="false" />
@@ -48,29 +49,30 @@
     <option name="hideEmptyMiddlePackages" value="true" />
     <option name="showLibraryContents" value="true" />
   </component>
-  <component name="PropertiesComponent">{
-  &quot;keyToString&quot;: {
-    &quot;Python 测试.Doctests (newton_brush_simulator 内).executor&quot;: &quot;Run&quot;,
-    &quot;Python.acc_video.executor&quot;: &quot;Run&quot;,
-    &quot;Python.brush.executor&quot;: &quot;Run&quot;,
-    &quot;Python.brush_width_calibration.executor&quot;: &quot;Run&quot;,
-    &quot;Python.check_pt.executor&quot;: &quot;Run&quot;,
-    &quot;Python.create_debug_data.executor&quot;: &quot;Run&quot;,
-    &quot;Python.example_ik_brush_trajectory.executor&quot;: &quot;Run&quot;,
-    &quot;Python.extract_pt.executor&quot;: &quot;Run&quot;,
-    &quot;Python.test.executor&quot;: &quot;Run&quot;,
-    &quot;Python.xpbd_warp_diff.executor&quot;: &quot;Run&quot;,
-    &quot;RunOnceActivity.ShowReadmeOnStart&quot;: &quot;true&quot;,
-    &quot;git-widget-placeholder&quot;: &quot;main&quot;,
-    &quot;last_opened_file_path&quot;: &quot;E:/Study/Wangxuan/CalliMaster/project/predict_traj/src/simulation/stroke_visualizations&quot;,
-    &quot;node.js.detected.package.eslint&quot;: &quot;true&quot;,
-    &quot;node.js.detected.package.tslint&quot;: &quot;true&quot;,
-    &quot;node.js.selected.package.eslint&quot;: &quot;(autodetect)&quot;,
-    &quot;node.js.selected.package.tslint&quot;: &quot;(autodetect)&quot;,
-    &quot;nodejs_package_manager_path&quot;: &quot;npm&quot;,
-    &quot;vue.rearranger.settings.migration&quot;: &quot;true&quot;
+  <component name="PropertiesComponent"><![CDATA[{
+  "keyToString": {
+    "Python 测试.Doctests (newton_brush_simulator 内).executor": "Run",
+    "Python.acc_video.executor": "Run",
+    "Python.brush.executor": "Run",
+    "Python.brush_simulation_env.executor": "Run",
+    "Python.brush_width_calibration.executor": "Run",
+    "Python.check_pt.executor": "Run",
+    "Python.create_debug_data.executor": "Run",
+    "Python.example_ik_brush_trajectory.executor": "Run",
+    "Python.extract_pt.executor": "Run",
+    "Python.test.executor": "Run",
+    "Python.xpbd_warp_diff.executor": "Run",
+    "RunOnceActivity.ShowReadmeOnStart": "true",
+    "git-widget-placeholder": "main",
+    "last_opened_file_path": "E:/Study/Wangxuan/CalliMaster/project/predict_traj/src/simulation/stroke_visualizations",
+    "node.js.detected.package.eslint": "true",
+    "node.js.detected.package.tslint": "true",
+    "node.js.selected.package.eslint": "(autodetect)",
+    "node.js.selected.package.tslint": "(autodetect)",
+    "nodejs_package_manager_path": "npm",
+    "vue.rearranger.settings.migration": "true"
   }
-}</component>
+}]]></component>
   <component name="RecentsManager">
     <key name="CopyFile.RECENT_KEYS">
       <recent name="E:\Study\Wangxuan\CalliMaster\project\predict_traj\src\simulation\stroke_visualizations" />
@@ -101,7 +103,7 @@
       <visibility group="运行配置" flag="true" />
     </myKeys>
   </component>
-  <component name="RunManager" selected="Python.example_ik_brush_trajectory">
+  <component name="RunManager" selected="Python.brush_simulation_env">
     <configuration name="brush" type="PythonConfigurationType" factoryName="Python" temporary="true" nameIsGenerated="true">
       <module name="predict_traj" />
       <option name="ENV_FILES" value="" />
@@ -125,6 +127,29 @@
       <option name="INPUT_FILE" value="" />
       <method v="2" />
     </configuration>
+    <configuration name="brush_simulation_env" type="PythonConfigurationType" factoryName="Python" temporary="true" nameIsGenerated="true">
+      <module name="predict_traj" />
+      <option name="ENV_FILES" value="" />
+      <option name="INTERPRETER_OPTIONS" value="" />
+      <option name="PARENT_ENVS" value="true" />
+      <envs>
+        <env name="PYTHONUNBUFFERED" value="1" />
+      </envs>
+      <option name="SDK_HOME" value="" />
+      <option name="WORKING_DIRECTORY" value="$PROJECT_DIR$/src/rl" />
+      <option name="IS_MODULE_SDK" value="true" />
+      <option name="ADD_CONTENT_ROOTS" value="true" />
+      <option name="ADD_SOURCE_ROOTS" value="true" />
+      <EXTENSION ID="PythonCoverageRunConfigurationExtension" runner="coverage.py" />
+      <option name="SCRIPT_NAME" value="$PROJECT_DIR$/src/rl/brush_simulation_env.py" />
+      <option name="PARAMETERS" value="--resample_dist 0.01 --xpbd_iterations 10" />
+      <option name="SHOW_COMMAND_LINE" value="false" />
+      <option name="EMULATE_TERMINAL" value="false" />
+      <option name="MODULE_MODE" value="false" />
+      <option name="REDIRECT_INPUT" value="false" />
+      <option name="INPUT_FILE" value="" />
+      <method v="2" />
+    </configuration>
     <configuration name="example_ik_brush_trajectory" type="PythonConfigurationType" factoryName="Python" nameIsGenerated="true">
       <module name="predict_traj" />
       <option name="ENV_FILES" value="" />
@@ -140,7 +165,7 @@
       <option name="ADD_SOURCE_ROOTS" value="true" />
       <EXTENSION ID="PythonCoverageRunConfigurationExtension" runner="coverage.py" />
       <option name="SCRIPT_NAME" value="$PROJECT_DIR$/src/simulation/example_ik_brush_trajectory.py" />
-      <option name="PARAMETERS" value="--resample_dist 0.01 --xpbd_iterations 10 --viewer gl --num-frames 240" />
+      <option name="PARAMETERS" value="--resample_dist 0.01 --xpbd_iterations 10 --viewer usd --num-frames 400" />
       <option name="SHOW_COMMAND_LINE" value="false" />
       <option name="EMULATE_TERMINAL" value="false" />
       <option name="MODULE_MODE" value="false" />
@@ -150,10 +175,12 @@
     </configuration>
     <list>
       <item itemvalue="Python.example_ik_brush_trajectory" />
+      <item itemvalue="Python.brush_simulation_env" />
       <item itemvalue="Python.brush" />
     </list>
     <recent_temporary>
       <list>
+        <item itemvalue="Python.brush_simulation_env" />
         <item itemvalue="Python.brush" />
       </list>
     </recent_temporary>
@@ -199,7 +226,11 @@
       <workItem from="1768462808614" duration="13160000" />
       <workItem from="1768566257664" duration="10728000" />
       <workItem from="1768596422206" duration="4580000" />
-      <workItem from="1768632416480" duration="1649000" />
+      <workItem from="1768632416480" duration="9395000" />
+      <workItem from="1768819262305" duration="3354000" />
+      <workItem from="1768900142845" duration="2435000" />
+      <workItem from="1768956483539" duration="2979000" />
+      <workItem from="1769497516813" duration="3290000" />
     </task>
     <task id="LOCAL-00001" summary="修正效果">
       <option name="closed" value="true" />
@@ -239,17 +270,17 @@
         </line-breakpoint>
         <line-breakpoint suspend="THREAD" type="python-line">
           <url>file://$PROJECT_DIR$/src/simulation/example_ik_brush_trajectory.py</url>
-          <line>1498</line>
+          <line>1560</line>
           <option name="timeStamp" value="60" />
         </line-breakpoint>
         <line-breakpoint suspend="THREAD" type="python-line">
           <url>file://$PROJECT_DIR$/src/simulation/example_ik_brush_trajectory.py</url>
-          <line>1796</line>
+          <line>1887</line>
           <option name="timeStamp" value="69" />
         </line-breakpoint>
         <line-breakpoint suspend="THREAD" type="python-line">
           <url>file://$PROJECT_DIR$/src/simulation/example_ik_brush_trajectory.py</url>
-          <line>1838</line>
+          <line>1929</line>
           <option name="timeStamp" value="70" />
         </line-breakpoint>
       </breakpoints>
@@ -260,10 +291,11 @@
     <SUITE FILE_PATH="coverage/predict_traj$create_debug_data.coverage" NAME="create_debug_data 覆盖结果" MODIFIED="1768596777298" SOURCE_PROVIDER="com.intellij.coverage.DefaultCoverageFileProvider" RUNNER="coverage.py" COVERAGE_BY_TEST_ENABLED="false" COVERAGE_TRACING_ENABLED="false" WORKING_DIRECTORY="$PROJECT_DIR$/src" />
     <SUITE FILE_PATH="coverage/predict_traj$extract_pt.coverage" NAME="extract_pt 覆盖结果" MODIFIED="1767702067708" SOURCE_PROVIDER="com.intellij.coverage.DefaultCoverageFileProvider" RUNNER="coverage.py" COVERAGE_BY_TEST_ENABLED="false" COVERAGE_TRACING_ENABLED="false" WORKING_DIRECTORY="$PROJECT_DIR$/utils" />
     <SUITE FILE_PATH="coverage/predict_traj$xpbd_warp_diff.coverage" NAME="xpbd_warp_diff 覆盖结果" MODIFIED="1767113870485" SOURCE_PROVIDER="com.intellij.coverage.DefaultCoverageFileProvider" RUNNER="coverage.py" COVERAGE_BY_TEST_ENABLED="false" COVERAGE_TRACING_ENABLED="false" WORKING_DIRECTORY="$PROJECT_DIR$/src/simulation" />
+    <SUITE FILE_PATH="coverage/predict_traj$brush_simulation_env.coverage" NAME="brush_simulation_env 覆盖结果" MODIFIED="1769504927897" SOURCE_PROVIDER="com.intellij.coverage.DefaultCoverageFileProvider" RUNNER="coverage.py" COVERAGE_BY_TEST_ENABLED="false" COVERAGE_TRACING_ENABLED="false" WORKING_DIRECTORY="$PROJECT_DIR$/src/rl" />
     <SUITE FILE_PATH="coverage/predict_traj$Doctests__newton_brush_simulator__.coverage" NAME="Doctests (newton_brush_simulator 内) 覆盖结果" MODIFIED="1768163786887" SOURCE_PROVIDER="com.intellij.coverage.DefaultCoverageFileProvider" RUNNER="coverage.py" COVERAGE_BY_TEST_ENABLED="false" COVERAGE_TRACING_ENABLED="false" WORKING_DIRECTORY="$PROJECT_DIR$/src/simulation" />
     <SUITE FILE_PATH="coverage/predict_traj$brush_width_calibration.coverage" NAME="brush_width_calibration 覆盖结果" MODIFIED="1768030548077" SOURCE_PROVIDER="com.intellij.coverage.DefaultCoverageFileProvider" RUNNER="coverage.py" COVERAGE_BY_TEST_ENABLED="false" COVERAGE_TRACING_ENABLED="false" WORKING_DIRECTORY="$PROJECT_DIR$/src/simulation" />
     <SUITE FILE_PATH="coverage/predict_traj$acc_video.coverage" NAME="acc_video 覆盖结果" MODIFIED="1767111873256" SOURCE_PROVIDER="com.intellij.coverage.DefaultCoverageFileProvider" RUNNER="coverage.py" COVERAGE_BY_TEST_ENABLED="false" COVERAGE_TRACING_ENABLED="false" WORKING_DIRECTORY="$PROJECT_DIR$/utils" />
-    <SUITE FILE_PATH="coverage/predict_traj$example_ik_brush_trajectory.coverage" NAME="example_ik_brush_trajectory 覆盖结果" MODIFIED="1768634034032" SOURCE_PROVIDER="com.intellij.coverage.DefaultCoverageFileProvider" RUNNER="coverage.py" COVERAGE_BY_TEST_ENABLED="false" COVERAGE_TRACING_ENABLED="false" WORKING_DIRECTORY="$PROJECT_DIR$/src/simulation" />
+    <SUITE FILE_PATH="coverage/predict_traj$example_ik_brush_trajectory.coverage" NAME="example_ik_brush_trajectory 覆盖结果" MODIFIED="1768820981252" SOURCE_PROVIDER="com.intellij.coverage.DefaultCoverageFileProvider" RUNNER="coverage.py" COVERAGE_BY_TEST_ENABLED="false" COVERAGE_TRACING_ENABLED="false" WORKING_DIRECTORY="$PROJECT_DIR$/src/simulation" />
     <SUITE FILE_PATH="coverage/predict_traj$check_pt.coverage" NAME="check_pt 覆盖结果" MODIFIED="1768300810648" SOURCE_PROVIDER="com.intellij.coverage.DefaultCoverageFileProvider" RUNNER="coverage.py" COVERAGE_BY_TEST_ENABLED="false" COVERAGE_TRACING_ENABLED="false" WORKING_DIRECTORY="$PROJECT_DIR$/utils" />
     <SUITE FILE_PATH="coverage/predict_traj$test.coverage" NAME="test 覆盖结果" MODIFIED="1768162541116" SOURCE_PROVIDER="com.intellij.coverage.DefaultCoverageFileProvider" RUNNER="coverage.py" COVERAGE_BY_TEST_ENABLED="false" COVERAGE_TRACING_ENABLED="false" WORKING_DIRECTORY="$PROJECT_DIR$/utils" />
   </component>

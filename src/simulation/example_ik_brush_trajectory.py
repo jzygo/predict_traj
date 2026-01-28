@@ -63,7 +63,16 @@ if str(PROJECT_ROOT) not in sys.path:
 # 导入毛笔物理仿真模块
 from simulation.model.brush import Brush
 from simulation.xpbd_warp_diff import XPBDSimulator
-from simulation.config import BRUSH_UP_POSITION
+from simulation.config import (
+    BRUSH_UP_POSITION,
+    WRITING_WORLD_SIZE,
+    BRUSH_RADIUS,
+    BRUSH_MAX_LENGTH,
+    BRUSH_LENGTH_RATIO,
+    TILT_ANGLE,
+    MAGIC_NUMBER_B,
+    MAGIC_NUMBER_K,
+)
 
 # 导入轨迹工具（用于弧长重采样）
 from data.traj_utils import resample_stroke, resample_stroke_by_dist
@@ -76,8 +85,6 @@ try:
     HAS_MATPLOTLIB = True
 except ImportError:
     HAS_MATPLOTLIB = False
-
-WRITING_WORLD_SIZE = 0.06
 
 
 def load_strokes_from_pkl(pkl_path: str, char_key: str = None) -> tuple:
@@ -143,8 +150,8 @@ def load_font_data(data_root: str) -> tuple:
     common_keys = sorted(list(set(strokes_data.keys()) & set(images_data.keys())))
     import random
     char_key = random.choice(common_keys)
-    # char_key = "下载 (1)"
-    char_key = "debug"
+    char_key = "下载 (1)"
+    # char_key = "debug"
     # 解码图像
     img_bytes = images_data[char_key]
     image = Image.open(io.BytesIO(img_bytes)).convert('RGB')
@@ -190,18 +197,10 @@ def build_brush(root_position: torch.Tensor = None, tangent_vector: torch.Tensor
         thickness=0.005,  # 毛发粗细
         root_position=root_position,
         tangent_vector=tangent_vector,  # 向下
-        length_ratio=BRUSH_LENGTH_RATIO,
+        fixed_length_ratio= 1 / 10,
+        free_length_ratio=1 - BRUSH_LENGTH_RATIO
     )
     return brush
-
-
-# 毛笔几何参数（与 build_brush 保持一致）
-BRUSH_RADIUS = 0.0055  # 毛笔最大半径
-BRUSH_MAX_LENGTH = 0.047  # 毛笔最大长度
-BRUSH_LENGTH_RATIO = 9 / 10  # 锥形部分占比
-TILT_ANGLE = 20.0
-MAGIC_NUMBER_B = 0.0
-MAGIC_NUMBER_K = 1.0
 
 
 def compute_brush_depth_from_radius(target_radius: float,
@@ -229,11 +228,67 @@ def compute_brush_depth_from_radius(target_radius: float,
 
     term2 = target_radius * math.sqrt(term_inside_sqrt)
 
-    d = term1 - term2 * MAGIC_NUMBER_K + (brush_max_length - H) + brush_max_length / (
-                WRITING_WORLD_SIZE * 2) * MAGIC_NUMBER_B
+    d = term1 - term2 * MAGIC_NUMBER_K + brush_max_length - H
 
     return d
 
+def compute_radius_from_brush_depth(d: float,
+                                    brush_radius: float = BRUSH_RADIUS,
+                                    brush_max_length: float = BRUSH_MAX_LENGTH,
+                                    brush_length_ratio: float = BRUSH_LENGTH_RATIO) -> float:
+    """
+    根据给定的笔刷深度 d，反推接触半径 r。
+    """
+    
+    # --- 1. 准备基础几何参数 (与原函数相同) ---
+    H = brush_max_length * brush_length_ratio
+    theta_rad = math.radians(TILT_ANGLE)
+    cos_theta = math.cos(theta_rad)
+    sin_theta = math.sin(theta_rad)
+
+    # --- 2. 计算中间项 (与原函数相同) ---
+    # 计算根号内的项
+    term_inside_sqrt = (H ** 2 / brush_radius ** 2) * (cos_theta ** 2) - (sin_theta ** 2)
+    
+    # 安全检查：防止根号下为负数 (虽然在原逻辑中应该保证为正)
+    if term_inside_sqrt <= 0:
+        return 0.0
+        
+    sqrt_val = math.sqrt(term_inside_sqrt)
+    
+    term1 = H * cos_theta
+    
+    # --- 3. 反转核心公式求解 r ---
+    # 原公式: d = term1 - (r * sqrt_val * MAGIC_NUMBER_K) + brush_max_length - H
+    # 变换后: r = (term1 + brush_max_length - H - d) / (sqrt_val * MAGIC_NUMBER_K)
+    
+    numerator = term1 + brush_max_length - H - d
+    denominator = sqrt_val * MAGIC_NUMBER_K
+    
+    if denominator == 0:
+        return 0.0 # 防止除以零
+        
+    calculated_r = numerator / denominator
+
+    # --- 4. 限制范围 (根据物理约束 Clamp) ---
+    # 计算物理上允许的最大半径 max_r
+    tan_alpha = brush_radius / (brush_max_length * brush_length_ratio)
+    alpha = math.atan(tan_alpha)
+    
+    # 注意：这里需要确保 cos 分母不为 0
+    cos_denominator = math.cos(alpha - math.radians(TILT_ANGLE))
+    if cos_denominator == 0:
+        max_r = brush_radius # 极端情况处理
+    else:
+        max_r = brush_radius * math.sqrt(
+            math.cos(alpha + math.radians(TILT_ANGLE)) / cos_denominator)
+
+    # 将计算出的 r 限制在 [0, max_r] 之间
+    # 这一步是为了模拟原函数中的 min(target_radius, max_r) 和 max(..., 0)
+    final_r = min(calculated_r, max_r)
+    final_r = max(final_r, 0.0)
+
+    return final_r
 
 def normalize_strokes_to_workspace(strokes: list,
                                    center: np.ndarray = np.array([0.45, 0.0, 0.25]),
@@ -613,10 +668,10 @@ class Example:
                 # 计算墨迹画布的边界 (Workspace Bounds)
                 c_off = self.coord_offset
 
-                min_x = writing_center[0] - writing_size * 1.1 + c_off[0]
-                max_x = writing_center[0] + writing_size * 1.1 + c_off[0]
-                min_y = writing_center[1] - writing_size * 1.1 + c_off[1]
-                max_y = writing_center[1] + writing_size * 1.1 + c_off[1]
+                min_x = writing_center[0] - (writing_size + BRUSH_MAX_LENGTH / 2) * 1.1 + c_off[0]
+                max_x = writing_center[0] + (writing_size + BRUSH_MAX_LENGTH / 2) * 1.1 + c_off[0]
+                min_y = writing_center[1] - (writing_size + BRUSH_MAX_LENGTH / 2) * 1.1 + c_off[1]
+                max_y = writing_center[1] + (writing_size + BRUSH_MAX_LENGTH / 2) * 1.1 + c_off[1]
 
                 self.canvas_bounds = (min_x, max_x, min_y, max_y)
 
@@ -700,6 +755,13 @@ class Example:
         # 墨迹写在固定书写平面上（统一 Z），再加一点偏移避免 z-fighting
         self.ink_plane_z = 0.0  # 默认书写平面高度；若加载了字体数据会自动覆盖
         self.ink_z_offset = -0.001  # 相对书写平面的Z偏移
+
+        # ------------------------------------------------------------------
+        # 像素画布墨迹参数
+        # ------------------------------------------------------------------
+        self.ink_canvas_resolution = 256  # 像素画布分辨率
+        self.ink_canvas = None  # 像素画布（二维布尔数组，记录哪些位置已有墨迹）
+        self.paper_z_threshold = 0.25  # 纸面高度阈值
 
         # ------------------------------------------------------------------
         # 木棍参数 (相对于末端执行器)
@@ -1443,9 +1505,9 @@ class Example:
             num_steps=num_sim_steps,
             batch_size=1,
             gravity=torch.tensor([0.0, 0.0, -MAX_GRAVITY], dtype=torch.float64),
-            dis_compliance=1e-8,
+            dis_compliance=1e-10,
             variable_dis_compliance=1e-8,
-            bending_compliance=1e-5,
+            bending_compliance_range=(1e-5, 1e-5),
             alignment_compliance_range=(1e-5, 1e-5),
             damping=0.3,
             canvas_resolution=256,
@@ -1698,75 +1760,104 @@ class Example:
         )
 
     def _update_ink_trail(self, tip_pos, is_pen_down):
-        """更新墨迹轨迹（按距离采样，并在段内插值补点）"""
-        if not is_pen_down:
-            self._last_ink_pos = None
+        """更新墨迹轨迹（基于像素画布逻辑，避免重复生成墨迹点）"""
+        # 基于毛笔粒子位置生成墨迹
+        if self.brush_particles_positions is None or len(self.brush_particles_positions) == 0:
             return
 
-        current = np.array(
-            [float(tip_pos[0]), float(tip_pos[1]), float(self.ink_plane_z) + self.ink_z_offset],
-            dtype=np.float32,
-        )
+        # 初始化像素画布（懒初始化）
+        if self.ink_canvas is None:
+            self.ink_canvas = np.zeros((self.ink_canvas_resolution, self.ink_canvas_resolution), dtype=np.bool_)
 
-        if self._last_ink_pos is None:
-            self.ink_trail.append(current)
-            self._last_ink_pos = current
-            return
+        # 获取画布边界
+        min_x, max_x, min_y, max_y = self.canvas_bounds
+        canvas_width = max_x - min_x
+        canvas_height = max_y - min_y
 
-        delta = current - self._last_ink_pos
-        dist = float(np.linalg.norm(delta))
+        # 纸面高度阈值（加一点容差）
+        z_threshold = self.paper_z_threshold + 0.0005
 
-        if dist < self.ink_min_move:
-            return
+        # 遍历所有毛笔粒子，检查是否接触纸面
+        for pos in self.brush_particles_positions:
+            if pos[2] <= z_threshold:
+                # 将世界坐标转换为画布像素坐标
+                px = int((pos[0] - min_x) / canvas_width * self.ink_canvas_resolution)
+                py = int((pos[1] - min_y) / canvas_height * self.ink_canvas_resolution)
 
-        step = max(float(self.ink_step_distance), 1e-6)
-        n_new = int(dist / step)
+                # 检查是否在画布范围内
+                if 0 <= px < self.ink_canvas_resolution and 0 <= py < self.ink_canvas_resolution:
+                    # 检查该像素位置是否已有墨迹
+                    if not self.ink_canvas[py, px]:
+                        # 标记该像素已有墨迹
+                        self.ink_canvas[py, px] = True
 
-        # 至少补 1 个点，确保连续
-        n_new = max(n_new, 1)
+                        # 计算该像素中心的世界坐标，用于渲染墨迹点
+                        world_x = min_x + (px + 0.5) / self.ink_canvas_resolution * canvas_width
+                        world_y = min_y + (py + 0.5) / self.ink_canvas_resolution * canvas_height
 
-        for i in range(1, n_new + 1):
-            t = i / (n_new + 0.0)
-            p = self._last_ink_pos * (1.0 - t) + current * t
-            self.ink_trail.append(p)
+                        ink_pos = np.array(
+                            [world_x, world_y, self.paper_z_threshold],
+                            dtype=np.float32,
+                        )
+                        self.ink_trail.append(ink_pos)
 
         # 维持最大点数（保留最新的）
         if len(self.ink_trail) > self.max_ink_points:
-            excess = len(self.ink_trail) - self.max_ink_points
-            del self.ink_trail[:excess]
-
-        self._last_ink_pos = current
+            self.ink_trail = self.ink_trail[-self.max_ink_points:]
 
     def _render_ink_trail(self):
-        """渲染墨迹轨迹"""
-        if len(self.ink_trail) == 0:
+        """渲染墨迹轨迹（修复USD模式下墨迹一次性全部显示的问题）"""
+        # 始终使用最大点数，保持拓扑结构固定
+        max_points = self.max_ink_points
+        current_count = len(self.ink_trail)
+
+        if max_points == 0:
             return
+            
+        # 1. 准备 Numpy 缓冲区 (全部初始化为 0)
+        # 位置 + 旋转 (7 floats: pos_x, pos_y, pos_z, rot_x, rot_y, rot_z, rot_w)
+        xforms_np = np.zeros((max_points, 7), dtype=np.float32)
+        # 缩放 (3 floats)
+        scales_np = np.zeros((max_points, 3), dtype=np.float32)
+        # 颜色 (3 floats)
+        colors_np = np.zeros((max_points, 3), dtype=np.float32)
 
-        n_points = len(self.ink_trail)
+        # 2. 填充旋转默认值 (Identity Quaternion: 0, 0, 0, 1)
+        xforms_np[:, 3:7] = [0.0, 0.0, 0.0, 1.0]
+        
+        # 3. 填充颜色默认值 (深黑色)
+        colors_np[:] = [0.05, 0.05, 0.05]
 
-        # 创建变换数组
-        ink_xforms = wp.zeros(n_points, dtype=wp.transform, device=self.viewer.device)
-        ink_scales = wp.array([[1.0, 1.0, 1.0]] * n_points, dtype=wp.vec3, device=self.viewer.device)
-        ink_colors = wp.array([[0.05, 0.05, 0.05]] * n_points, dtype=wp.vec3, device=self.viewer.device)  # 深黑色墨迹
-        ink_materials = wp.zeros(n_points, dtype=wp.int32, device=self.viewer.device)
+        # 4. 填充有效数据 (Active Points)
+        if current_count > 0:
+            # 将 list 转为 array 以便快速赋值
+            # 注意：ink_trail 是 list of np.array/wp.vec3，这里假设它是 list of arrays
+            active_positions = np.array(self.ink_trail)
+            
+            # 设置有效位置
+            xforms_np[:current_count, 0:3] = active_positions
+            
+            # 设置有效缩放 (可见)
+            scales_np[:current_count] = [0.1, 0.1, 0.1]
 
-        # 设置每个墨迹点的位置
-        xforms_np = np.zeros((n_points, 7), dtype=np.float32)
-        for i, pos in enumerate(self.ink_trail):
-            xforms_np[i, 0:3] = pos  # 位置
-            xforms_np[i, 3:7] = [0.0, 0.0, 0.0, 1.0]  # 单位四元数
+        # 5. 转换 Warp Arrays
+        ink_xforms = wp.array(
+            [
+                wp.transform(
+                    wp.vec3(float(xforms_np[i, 0]), float(xforms_np[i, 1]), float(xforms_np[i, 2])),
+                    wp.quat(float(xforms_np[i, 3]), float(xforms_np[i, 4]), float(xforms_np[i, 5]), float(xforms_np[i, 6]))
+                )
+                for i in range(max_points)
+            ],
+            dtype=wp.transform,
+            device=self.viewer.device
+        )
+        
+        ink_scales = wp.array(scales_np, dtype=wp.vec3, device=self.viewer.device)
+        ink_colors = wp.array(colors_np, dtype=wp.vec3, device=self.viewer.device)
+        ink_materials = wp.zeros(max_points, dtype=wp.int32, device=self.viewer.device)
 
-        # 转换为 warp transform 数组
-        ink_xforms_list = []
-        for i in range(n_points):
-            tf = wp.transform(
-                wp.vec3(xforms_np[i, 0], xforms_np[i, 1], xforms_np[i, 2]),
-                wp.quat_identity()
-            )
-            ink_xforms_list.append(tf)
-
-        ink_xforms = wp.array(ink_xforms_list, dtype=wp.transform, device=self.viewer.device)
-
+        # 6. 提交给 Viewer
         self.viewer.log_instances(
             "ink_trail_instance",
             "ink_mesh",
@@ -1998,6 +2089,7 @@ class Example:
 
             all_points = []
 
+            vec_compute_radius = np.vectorize(compute_radius_from_brush_depth)
             for i, stroke in enumerate(self.strokes):
                 stroke_np = np.array(stroke)
                 xy = stroke_np[:, :2]
@@ -2007,8 +2099,11 @@ class Example:
                 all_points.append(xy)
 
                 # 计算 r 值 (保持原有逻辑)
-                depths = - (z_vals - base_z - BRUSH_MAX_LENGTH)
-                r_vals = (depths) * BRUSH_RADIUS / (BRUSH_MAX_LENGTH * BRUSH_LENGTH_RATIO)
+                d_inputs = z_vals - base_z 
+                # 直接传入数组，输出也是数组
+                r_vals = vec_compute_radius(d_inputs)
+                # 3. 确保非负 (Numpy 操作)
+                r_vals = np.maximum(r_vals, 0)
                 r_vals = np.maximum(r_vals, 0)  # 确保半径非负
 
                 # 创建圆的 Patch 集合
@@ -2137,14 +2232,12 @@ class Example:
                 self._render_brush_particles()
 
             # 更新并渲染墨迹轨迹（使用毛笔最低点或木棍端点）
-            if self.enable_brush_physics and self.brush_particles_positions is not None:
+            if self.enable_brush_physics and self.brush_particles_positions is not None and int(self.sim_time / self.frame_dt) % 2 == 0:
                 # 使用毛笔最低粒子作为墨迹参考点
                 brush_tip_pos = self._get_brush_tip_position()
                 if brush_tip_pos is not None:
                     self._update_ink_trail(brush_tip_pos, self._is_pen_down)
-            else:
-                self._update_ink_trail(tip_pos, self._is_pen_down)
-            # self._render_ink_trail()
+            self._render_ink_trail()
 
             # 每秒打印状态
             if int(self.sim_time * self.fps) % self.fps == 0:

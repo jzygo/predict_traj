@@ -375,6 +375,101 @@ def solve_distance_constraints(
 
 
 @wp.kernel
+def solve_bending_constraints(
+        positions: wp.array(dtype=wp.vec3d, ndim=3),
+        inv_masses: wp.array(dtype=wp.float64, ndim=2),
+        constraint_indices: wp.array(dtype=wp.vec3i),  # (point_a, point_b, point_c) - b是中间点
+        rest_distances: wp.array(dtype=wp.float64),  # 未使用，保留接口兼容
+        compliances: wp.array(dtype=wp.float64),
+        lagrange_multipliers: wp.array(dtype=wp.float64),
+        deltas_x: wp.array(dtype=wp.float64, ndim=2),
+        deltas_y: wp.array(dtype=wp.float64, ndim=2),
+        deltas_z: wp.array(dtype=wp.float64, ndim=2),
+        dt: wp.float64,
+        num_constraints: int
+):
+    """弯曲约束求解器 - 将中间点 B 拉到 AC 连线的投影位置。
+
+    对于三个连续粒子 A, B, C：
+    - 计算 B 在 AC 连线上的投影点 P
+    - 将 B 拉向 P，使三点趋向共线
+
+    这种方式直接约束直线性，只移动中间点 B。
+    固定使用 time_step=1 (now_position)
+
+    对于毛笔毛发：
+    - 根部 compliance 较小（硬），保持笔头形状
+    - 尖端 compliance 较大（软），允许自然弯曲和飘逸
+    """
+    batch_id, tid = wp.tid()
+    if tid >= num_constraints:
+        return
+
+    idx = constraint_indices[tid]
+    i, j, k = idx[0], idx[1], idx[2]  # i=point_a, j=point_b(中间), k=point_c
+
+    # 固定使用 time_step=1 (now_position)
+    pa = positions[batch_id, 1, i]  # point_a
+    pb = positions[batch_id, 1, j]  # point_b (中间点)
+    pc = positions[batch_id, 1, k]  # point_c
+
+    # 计算 AC 向量
+    ac = pc - pa
+    ac_length_sq = wp.dot(ac, ac)
+
+    epsilon = wp.float64(1e-15)
+    if ac_length_sq < epsilon:
+        return
+
+    # 计算 B 在 AC 连线上的投影点 P
+    # P = A + t * AC, 其中 t = (AB · AC) / |AC|²
+    ab = pb - pa
+    t = wp.dot(ab, ac) / ac_length_sq
+
+    # 投影点 P
+    p_proj = pa + t * ac
+
+    # 计算 B 到投影点 P 的偏移（即违反量）
+    diff = pb - p_proj
+    dist = wp.length(diff)
+
+    if dist < epsilon:
+        return
+
+    # 方向向量（从 P 指向 B，即需要修正的方向）
+    n = diff / dist
+
+    # 只有中间点 B 参与修正
+    w_b = inv_masses[batch_id, j]
+
+    if w_b < epsilon:
+        return
+
+    # XPBD 求解
+    alpha = wp.max(compliances[tid] / (dt * dt), epsilon)
+    denom = w_b + alpha
+
+    # 违反量就是 B 到投影点的距离
+    numerator = -(dist + alpha * lagrange_multipliers[tid])
+    delta_lambda = numerator / denom
+
+    # 限制最大修正量以保持稳定性
+    ac_length = wp.sqrt(ac_length_sq)
+    max_correction = wp.float64(0.1) * ac_length
+    delta_lambda = wp.clamp(delta_lambda, -max_correction, max_correction)
+
+    lagrange_multipliers[tid] = lagrange_multipliers[tid] + delta_lambda
+
+    # 修正向量（将 B 拉向 P）
+    correction = delta_lambda * n
+
+    # 只修正中间点 B
+    wp.atomic_add(deltas_x, batch_id, j, correction[0])
+    wp.atomic_add(deltas_y, batch_id, j, correction[1])
+    wp.atomic_add(deltas_z, batch_id, j, correction[2])
+
+
+@wp.kernel
 def process_ink_canvas(
         ink_canvas: wp.array(dtype=wp.float64, ndim=2),
         canvas_resolution: int
@@ -571,19 +666,39 @@ def solve_alignment_constraints(
     # blend_weight = 0: 完全锥形
     # blend_weight = 1: 完全延长线
 
-    blend_weight = blend_weight * wp.float64(0.8)  # 调整混合权重，减少延长线目标的影响，增强收拢效果
+    blend_weight = blend_weight * blend_weight  # 调整混合权重，减少延长线目标的影响，增强收拢效果
 
     p_proj = p_cone_proj * (wp.float64(1.0) - blend_weight) + p_line_proj * blend_weight
     # p_proj = p_cone_proj
 
     # 计算修正
     diff = p_free - p_proj
-    dist = wp.length(diff)
     
-    # 如果目标在纸面下方，增加修正强度
-    if p_proj[2] <= limit_plane_z + eps:
-        diff = diff * wp.float64(1.0)
-        dist = wp.length(diff)
+    # 对于穿透纸面的目标点，只约束垂直于（中心轴与z轴平面）方向的分量
+    target_penetrated = p_proj[2] <= limit_plane_z + eps
+    
+    if target_penetrated:
+        # 计算中心轴在xy平面上的投影
+        axis_xy = wp.vec3d(axis[0], axis[1], wp.float64(0.0))
+        axis_xy_len = wp.length(axis_xy)
+        
+        if axis_xy_len > eps:
+            # 垂直于（中心轴与z轴平面）且在xy平面内的单位向量（即平面的法向量）
+            n_xy = wp.vec3d(axis[1] / axis_xy_len, -axis[0] / axis_xy_len, wp.float64(0.0))
+            # 中心轴在xy平面上的归一化方向（与n_xy在xy平面内垂直）
+            t_xy = wp.vec3d(axis[0] / axis_xy_len, axis[1] / axis_xy_len, wp.float64(0.0))
+            
+            # 将diff投影到n_xy方向（强约束）
+            diff_n_component = wp.dot(diff, n_xy)
+            # 将diff投影到t_xy方向（弱约束，削弱系数）
+            diff_t_component = wp.dot(diff, t_xy)
+            weaken_factor = wp.float64(0.3)  # 削弱因子，可调节（0-1之间，越小约束越弱）
+            
+            # 组合两个分量：n_xy方向保持原强度，t_xy方向削弱
+            diff = n_xy * diff_n_component + t_xy * diff_t_component * weaken_factor
+        # 如果中心轴与z轴平行，则不做特殊处理，使用完整的diff
+    
+    dist = wp.length(diff)
 
     if dist < eps:
         return
@@ -980,7 +1095,8 @@ class XPBDSimulator:
                  gravity: torch.Tensor = torch.tensor([0.0, 0.0, -9.81], dtype=torch.float64),
                  dis_compliance: float = 1e-8,  # 降低compliance使毛发内部距离约束更硬
                  variable_dis_compliance: float = 0.01,
-                 bending_compliance: float = 1e-6,  # 弯曲约束compliance，值越小毛发越硬
+                 bending_compliance: float = 1e-6,  # 弯曲约束compliance（已废弃，使用 bending_compliance_range）
+                 bending_compliance_range: Tuple[float, float] = (1e-7, 1e-7),  # 弯曲约束compliance范围 (root, tip)：根部硬，尖端软
                  damping: float = 0.3,  # 增加阻尼以提高稳定性
                  restitution: float = 0.5,
                  friction: float = 0.3,
@@ -992,7 +1108,7 @@ class XPBDSimulator:
                  splat_radius_px: int = 1,  # 溅射半径（像素，2->5x5 邻域）
                  fixed_stiffness: float = 0.6,  # 软固定约束的收敛强度 (0,1]，越大越“硬”
                  alignment_compliance_range: Tuple[float, float] = (1e-4, 1e-4),  # 对齐约束compliance范围 (root, tip)
-                 collision_radius: float = 0.0005,  # 碰撞半径，粒子间距离小于2*collision_radius时产生碰撞
+                 collision_radius: float = 0.0001,  # 碰撞半径，粒子间距离小于2*collision_radius时产生碰撞
                  collision_compliance: float = 1e-6,  # 碰撞约束的柔度
                  enable_collision: bool = True,  # 是否启用碰撞检测
                  max_collision_pairs: int = 10000,  # 每个batch最大碰撞对数量
@@ -1017,6 +1133,7 @@ class XPBDSimulator:
         self.dis_compliance = dis_compliance
         self.variable_dis_compliance = variable_dis_compliance
         self.bending_compliance = bending_compliance
+        self.bending_compliance_range = bending_compliance_range  # (root, tip): 根部硬，尖端软
         self.alignment_compliance_range = alignment_compliance_range
         self.collision_radius = collision_radius
         self.collision_compliance = collision_compliance
@@ -1292,7 +1409,15 @@ class XPBDSimulator:
                 j = constraint.point_b.particle_id  # 中间点（记录但不直接参与约束）
                 k = constraint.point_c.particle_id
                 rest_dist = constraint.rest_distance
-                compliance = self.bending_compliance
+                
+                # 根据粒子在毛发上的位置计算 variable compliance
+                # relative_location: 0.0 (根部) -> 1.0 (尖端)
+                # 根部 compliance 较小（硬），尖端 compliance 较大（软）
+                # 这模拟了毛笔毛发的特点：根部固定硬挺，尖端柔软灵活
+                comp_root, comp_tip = self.bending_compliance_range
+                t = constraint.relative_location
+                compliance = comp_root + (comp_tip - comp_root) * t
+                
                 bending_data.append((i, j, k, rest_dist, compliance))
 
             elif isinstance(constraint, AlignmentConstraint):
@@ -1642,6 +1767,27 @@ class XPBDSimulator:
                         self.sub_dt,
                         self.num_alignment_constraints,
                         PLANE_Z
+                    ],
+                    device=self.device
+                )
+
+            # Solve bending constraints (maintain hair straightness, variable compliance: root hard, tip soft)
+            if self.bending_indices is not None and self.num_bending_constraints > 0:
+                wp.launch(
+                    solve_bending_constraints,
+                    dim=(self.batch_size, self.num_bending_constraints),
+                    inputs=[
+                        self.positions,
+                        self.inv_masses,
+                        self.bending_indices,
+                        self.bending_rest_distances,
+                        self.bending_compliances,
+                        self.bending_lambdas,
+                        self._delta_x,
+                        self._delta_y,
+                        self._delta_z,
+                        self.sub_dt,
+                        self.num_bending_constraints
                     ],
                     device=self.device
                 )

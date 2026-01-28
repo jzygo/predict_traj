@@ -70,11 +70,20 @@ class Hair:
                 dist_ab = torch.norm(point_b.position - point_a.position).item()
                 dist_bc = torch.norm(point_c.position - point_b.position).item()
                 rest_dist_ac = dist_ab + dist_bc
+                
+                # 计算这个弯曲约束在毛发上的相对位置
+                # 使用中间粒子 (i+1) 的位置来确定 relative_location
+                # 0.0 = 根部（硬，保持形状）, 1.0 = 尖端（软，自然弯曲）
+                num_particles = len(self.particles)
+                # 中间粒子索引 i+1，相对位置 = (i+1) / (num_particles - 1)
+                relative_loc = (i + 1) / (num_particles - 1) if num_particles > 1 else 0.0
+                
                 bending_constraint = BendingConstraint(
                     self.particles[i],
                     self.particles[i + 1],
                     self.particles[i + 2],
-                    rest_distance=rest_dist_ac
+                    rest_distance=rest_dist_ac,
+                    relative_location=relative_loc
                 )
                 self.constraints.append(bending_constraint)
 
@@ -120,10 +129,11 @@ class Particle:
 
 class Brush:
     def __init__(self, radius, max_length, max_hairs, max_particles_per_hair, thickness, root_position=None,
-                 length_ratio=5 / 6, tangent_vector=None, normal_vector=None):
+                 fixed_length_ratio=1 / 10, free_length_ratio=5 / 6, tangent_vector=None, normal_vector=None):
         self.radius = radius
         self.max_length = max_length
-        self.length_ratio = length_ratio
+        self.free_length_ratio = free_length_ratio
+        self.fixed_length_ratio = fixed_length_ratio
         self.max_hairs = max_hairs
         self.max_particles_per_hair = max_particles_per_hair
         self.thickness = thickness
@@ -172,8 +182,9 @@ class Brush:
             fixed_particles = []
             for particle in hair.particles:
                 dis = torch.norm(particle.position - hair.root_position).item()
-                if dis < 1 / 10 * self.max_length:
+                if dis < self.fixed_length_ratio * self.max_length:
                     self.constraints.append(FixedPointConstraint(particle))
+                    # if dis < self.free_length_ratio * self.max_length:
                     fixed_particles.append(particle)
 
             if len(fixed_particles) >= 2:
@@ -196,7 +207,9 @@ class Brush:
                     rest_ratio = dist_start_free / dist_start_end
                     
                     # Calculate relative location (0.0 at root-end/free-start, 1.0 at tip)
-                    if num_free_particles > 1:
+                    if k < self.free_length_ratio * self.max_particles_per_hair:
+                        relative_loc = 0.0
+                    elif num_free_particles > 1:
                         relative_loc = (k - start_idx) / (num_free_particles - 1)
                     else:
                         relative_loc = 1.0
